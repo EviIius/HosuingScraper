@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Housing Scraper</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- ===== HEADER ===== -->
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="header-brand">
+        <span class="header-icon">🏠</span>
+        <h1 class="header-title">Housing Scraper</h1>
+        <span class="header-sub">Craigslist apartment listings</span>
+      </div>
+      <div class="header-actions">
+        <div id="status-badge" class="status-badge status-idle">Idle</div>
+        <button id="btn-scrape" class="btn btn-primary" title="Fetch latest listings from Craigslist">
+          <span class="btn-icon">⟳</span> Scrape Now
+        </button>
+        <button id="btn-history" class="btn btn-secondary" title="Show scrape history">History</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ===== SCRAPE MODAL ===== -->
+  <div id="modal-scrape" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="modal-scrape-title">
+    <div class="modal-box">
+      <h2 id="modal-scrape-title" class="modal-title">Start a New Scrape</h2>
+      <label class="form-label" for="scrape-city">City</label>
+      <select id="scrape-city" class="form-select"></select>
+
+      <label class="form-label" for="scrape-pages">Pages to scrape <span class="hint">(1 page ≈ 120 listings)</span></label>
+      <input id="scrape-pages" class="form-input" type="number" min="1" max="5" value="2" />
+
+      <div class="modal-actions">
+        <button id="btn-scrape-confirm" class="btn btn-primary">Start Scrape</button>
+        <button class="btn btn-secondary modal-close" data-modal="modal-scrape">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== HISTORY MODAL ===== -->
+  <div id="modal-history" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="modal-history-title">
+    <div class="modal-box modal-box--wide">
+      <h2 id="modal-history-title" class="modal-title">Scrape History</h2>
+      <div id="history-table-wrap">
+        <p class="empty-msg">Loading…</p>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary modal-close" data-modal="modal-history">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== FILTERS ===== -->
+  <div class="filters-bar">
+    <div class="filters-inner">
+      <div class="filter-group">
+        <label class="form-label" for="filter-city">City</label>
+        <select id="filter-city" class="form-select filter-select">
+          <option value="">All cities</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <label class="form-label" for="filter-bedrooms">Bedrooms</label>
+        <select id="filter-bedrooms" class="form-select filter-select">
+          <option value="">Any</option>
+          <option value="1">1 br</option>
+          <option value="2">2 br</option>
+          <option value="3">3 br</option>
+          <option value="4">4+ br</option>
+        </select>
+      </div>
+      <button id="btn-clear" class="btn btn-secondary btn-sm">Clear Filters</button>
+      <span id="result-count" class="result-count"></span>
+    </div>
+  </div>
+
+  <!-- ===== MAIN ===== -->
+  <main class="main-content">
+    <div id="listings-grid" class="listings-grid">
+      <!-- cards injected by JS -->
+    </div>
+
+    <!-- Empty / loading states -->
+    <div id="state-loading" class="state-panel hidden">
+      <div class="spinner"></div>
+      <p>Loading listings…</p>
+    </div>
+    <div id="state-empty" class="state-panel hidden">
+      <p class="state-emoji">🏚️</p>
+      <p class="state-title">No listings found</p>
+      <p class="state-hint">Try a different city or press <strong>Scrape Now</strong> to fetch listings.</p>
+    </div>
+    <div id="state-error" class="state-panel hidden">
+      <p class="state-emoji">⚠️</p>
+      <p class="state-title">Something went wrong</p>
+      <p id="state-error-msg" class="state-hint"></p>
+    </div>
+
+    <!-- Pagination -->
+    <div id="pagination" class="pagination hidden">
+      <button id="btn-prev" class="btn btn-secondary btn-sm" disabled>← Prev</button>
+      <span id="page-info" class="page-info"></span>
+      <button id="btn-next" class="btn btn-secondary btn-sm">Next →</button>
+    </div>
+  </main>
+
+  <!-- ===== FOOTER ===== -->
+  <footer class="site-footer">
+    <p>Data sourced from Craigslist. For personal, non-commercial use only.</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
