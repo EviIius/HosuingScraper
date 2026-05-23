@@ -1,9 +1,20 @@
 """
-House listing scraper for Charlotte, NC area.
+Housing listing scrapers for Charlotte, NC and surrounding area.
 
-Source: Redfin GIS CSV endpoint.
-One visit to the Charlotte search page sets the session cookies that
-allow the GIS CSV endpoint to return results for individual ZIP codes.
+Sources
+-------
+- Redfin       : GIS CSV endpoint (cookie-warmed, plain requests)
+- Estately     : server-rendered HTML, plain requests
+- Craigslist   : server-rendered HTML, plain requests
+- Zillow       : SeleniumBase UC -> __NEXT_DATA__ JSON
+- Realtor.com  : SeleniumBase UC -> JSON-LD CollectionPage
+- Apartments   : SeleniumBase UC -> placard DOM (rentals only)
+
+Why SeleniumBase instead of Playwright?
+Playwright depends on the compiled `greenlet` extension, whose .pyd is
+blocked by Windows Application Control on some installs. Selenium has no
+such dependency and SeleniumBase's "UC Mode" handles Cloudflare and
+PerimeterX challenges out of the box.
 """
 
 import csv
@@ -21,38 +32,18 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Charlotte, NC area ZIP codes → Redfin region_ids (region_type=2)
+# Charlotte, NC area ZIP codes -> Redfin region_ids (region_type=2)
 # Discovered by fetching https://www.redfin.com/zipcode/{ZIP} and extracting
 # the embedded "region_id=" parameter from the page HTML.
 # ---------------------------------------------------------------------------
 CHARLOTTE_ZIP_REGIONS: dict[int, int] = {
-    28202: 11345,   # Uptown / Center City
-    28203: 11346,   # South End / Dilworth
-    28204: 11347,   # Elizabeth / Myers Park
-    28205: 11348,   # Plaza Midwood / NoDa
-    28206: 11349,   # North Charlotte
-    28207: 11350,   # Myers Park
-    28208: 11351,   # West Charlotte
-    28209: 11352,   # Sedgefield / Madison Park
-    28210: 11353,   # South Charlotte / Carmel
-    28211: 11354,   # Cotswold / Eastover
-    28212: 11355,   # East Charlotte / Mint Hill
-    28213: 11356,   # University City
-    28214: 11357,   # Steele Creek / West Charlotte
-    28215: 11358,   # Hickory Ridge / East Charlotte
-    28216: 11359,   # Coulwood / NW Charlotte
-    28217: 11360,   # Westerly Hills / Airport area
-    28226: 11368,   # Ballantyne / Pineville
-    28227: 11369,   # Matthews / East Charlotte
-    28262: 11393,   # University City / NE Charlotte
-    28269: 11397,   # Huntersville / N Charlotte
-    28270: 11398,   # Matthews
-    28273: 11401,   # Steele Creek / SW Charlotte
-    28277: 11404,   # Ballantyne
-    28278: 11405,   # Lake Wylie / SW Charlotte
-    28134: 11320,   # Pineville
-    28105: 11298,   # Matthews
-    28104: 11297,   # Matthews / Stallings
+    28202: 11345, 28203: 11346, 28204: 11347, 28205: 11348,
+    28206: 11349, 28207: 11350, 28208: 11351, 28209: 11352,
+    28210: 11353, 28211: 11354, 28212: 11355, 28213: 11356,
+    28214: 11357, 28215: 11358, 28216: 11359, 28217: 11360,
+    28226: 11368, 28227: 11369, 28262: 11393, 28269: 11397,
+    28270: 11398, 28273: 11401, 28277: 11404, 28278: 11405,
+    28134: 11320, 28105: 11298, 28104: 11297,
 }
 
 # Friendly area labels for the filter dropdown
@@ -69,14 +60,37 @@ CHARLOTTE_AREAS: dict[str, str] = {
     "concord":      "Concord",
     "harrisburg":   "Harrisburg",
     "stallings":    "Stallings",
+    "gastonia":     "Gastonia",
+    "rock hill":    "Rock Hill",
+    "fort mill":    "Fort Mill",
 }
 
 SCRAPE_SOURCES: dict[str, str] = {
-    "redfin":      "Redfin",
-    "zillow":      "Zillow",
-    "realtor":     "Realtor.com",
-    "craigslist":  "Craigslist",
-    "estately":    "Estately",
+    "redfin":         "Redfin",
+    "zillow":         "Zillow",
+    "realtor":        "Realtor.com",
+    "craigslist":     "Craigslist",
+    "estately":       "Estately",
+    "apartments":     "Apartments.com",
+    "searchcharlotte": "SearchCharlotte (BHHS)",
+}
+
+# Curated Charlotte-area neighborhoods -> ZIP groups. Used by the
+# Neighborhood filter on the frontend.
+CHARLOTTE_NEIGHBORHOODS: dict[str, dict] = {
+    "south_end":      {"label": "South End / LoSo",          "zips": ["28203", "28209"]},
+    "uptown":         {"label": "Uptown / Center City",       "zips": ["28202"]},
+    "dilworth":       {"label": "Dilworth",                   "zips": ["28203"]},
+    "noda":           {"label": "NoDa / Plaza Midwood",       "zips": ["28205"]},
+    "myers_park":     {"label": "Myers Park",                 "zips": ["28207", "28209"]},
+    "elizabeth":      {"label": "Elizabeth / Chantilly",      "zips": ["28204"]},
+    "ballantyne":     {"label": "Ballantyne",                 "zips": ["28277", "28226"]},
+    "university":     {"label": "University City",            "zips": ["28213", "28262"]},
+    "steele_creek":   {"label": "Steele Creek",               "zips": ["28273", "28278"]},
+    "cotswold":       {"label": "Cotswold / Eastover",        "zips": ["28211"]},
+    "uc_concord":     {"label": "Concord / Harrisburg",       "zips": ["28025", "28027", "28075"]},
+    "huntersville":   {"label": "Huntersville / Cornelius",   "zips": ["28078", "28031"]},
+    "matthews":       {"label": "Matthews / Mint Hill",       "zips": ["28105", "28104", "28227"]},
 }
 
 _HEADERS = {
@@ -90,27 +104,178 @@ _HEADERS = {
     "Connection":      "keep-alive",
 }
 
+_DASH = " – "  # en-dash separator used in titles
+
+
+# ---------------------------------------------------------------------------
+# Normalisation helpers
+# ---------------------------------------------------------------------------
+
+_KNOWN_CITIES: set[str] = {
+    "charlotte", "matthews", "pineville", "huntersville", "mint hill",
+    "cornelius", "davidson", "concord", "harrisburg", "stallings",
+    "weddington", "waxhaw", "fort mill", "rock hill", "lake wylie",
+    "ballantyne", "belmont", "mooresville", "denver", "iron station",
+    "mount holly", "gastonia", "kannapolis", "indian trail", "marvin",
+    "monroe", "wesley chapel", "cramerton", "lowell", "bessemer city",
+    "uninc",
+}
+
+
+def _norm_city(val: str) -> str:
+    city = (val or "").strip().lower()
+    if not city:
+        return "charlotte"
+    if city in _KNOWN_CITIES:
+        return city
+    parts = city.split(" ", 1)
+    if len(parts) == 2 and parts[1] in _KNOWN_CITIES:
+        return parts[1]
+    return city
+
+
+def _norm_beds(val: str) -> str:
+    v = (val or "").strip()
+    if v and v not in ("—", "N/A"):
+        try:
+            return str(int(float(v)))
+        except ValueError:
+            return v
+    return ""
+
+
+def _norm_baths(val: str) -> str:
+    v = (val or "").strip()
+    if v and v not in ("—", "N/A"):
+        try:
+            n = float(v)
+            return str(int(n)) if n == int(n) else str(n)
+        except ValueError:
+            return v
+    return ""
+
+
+def _norm_sqft(val: str) -> str:
+    v = (val or "").strip().replace(",", "")
+    if v and v not in ("—", "N/A"):
+        try:
+            return str(int(float(v)))
+        except ValueError:
+            return v
+    return ""
+
+
+def _camel_to_words(s: str) -> str:
+    """SingleFamilyResidence -> 'Single Family Residence'."""
+    return re.sub(r"(?<!^)(?=[A-Z])", " ", s or "")
+
+
+def _price_in_band(price_raw, min_p: int | None, max_p: int | None) -> bool:
+    """
+    Return True if a listing's price falls within [min_p, max_p].
+
+    Listings with missing/unparseable prices are kept when neither bound is
+    set, but dropped as soon as either bound is set (the user explicitly
+    asked for a price range, so price-less listings aren't useful).
+    """
+    if min_p is None and max_p is None:
+        return True
+    try:
+        p = int(float(str(price_raw or "").replace(",", "").replace("$", "")))
+    except (ValueError, TypeError):
+        return False
+    if min_p is not None and p < min_p:
+        return False
+    if max_p is not None and p > max_p:
+        return False
+    return True
+
+
+def _apply_price_filter(rows: list[dict], min_p: int | None, max_p: int | None) -> list[dict]:
+    """Filter a list of scraped listings by price (safety net for sources
+    where we couldn't push the filter to the source URL)."""
+    if min_p is None and max_p is None:
+        return rows
+    return [r for r in rows if _price_in_band(r.get("price"), min_p, max_p)]
+
+
+# A progress callback is `cb(step, total, detail)` where step/total describe
+# the current source's loop position and `detail` is a short user-facing
+# string (e.g., "ZIP 28207", "page 3"). Always called safely.
+def _emit_progress(cb, step: int, total: int, detail: str) -> None:
+    if cb is None:
+        return
+    try:
+        cb(step, total, detail)
+    except Exception:
+        pass
+
+
+_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
+
+
+def _extract_zip(*candidates: str) -> str:
+    """Return the first 5-digit ZIP found in any of the candidate strings."""
+    for c in candidates:
+        if not c:
+            continue
+        m = _ZIP_RE.search(str(c))
+        if m:
+            return m.group(1)
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Shared SeleniumBase UC helper
+# ---------------------------------------------------------------------------
+
+_SB_RECONNECT = 6
+
+
+def _open_uc_session():
+    """
+    Return a SeleniumBase UC context manager.
+
+    Usage:
+        with _open_uc_session() as sb:
+            sb.uc_open_with_reconnect(url, reconnect_time=_SB_RECONNECT)
+            sb.sleep(4)
+            html = sb.get_page_source()
+    """
+    try:
+        from seleniumbase import SB
+    except ImportError as exc:
+        raise RuntimeError(
+            "SeleniumBase is not installed. Run: pip install seleniumbase"
+        ) from exc
+
+    return SB(
+        uc=True,
+        headless=True,
+        test=False,
+        locale="en-US",
+        ad_block=True,
+        block_images=True,  # ~3x faster page loads; we don't render images
+    )
+
+
+# ---------------------------------------------------------------------------
+# Redfin scraper (GIS CSV endpoint, plain requests)
+# ---------------------------------------------------------------------------
 
 def scrape_redfin_charlotte(
     listing_type: str = "for_sale",
     max_pages: int = 1,
     zip_codes: list[int] | None = None,
+    min_price: int | None = None,
+    max_price: int | None = None,
+    progress_cb=None,
 ) -> list[dict]:
     """
-    Scrape Redfin house listings for Charlotte, NC.
+    Scrape Redfin house listings for Charlotte, NC via the GIS CSV endpoint.
 
-    Strategy
-    --------
-    1. Visit https://www.redfin.com/NC/Charlotte to acquire session cookies —
-       this is required for the GIS CSV endpoint to return results.
-    2. For each Charlotte ZIP code, call the GIS CSV endpoint with the
-       verified region_id.
-
-    Parameters
-    ----------
-    listing_type : 'for_sale' | 'for_rent'
-    max_pages    : pages per ZIP (1 page ≈ 200 listings; usually enough per ZIP)
-    zip_codes    : specific ZIPs to query; defaults to all Charlotte ZIPs
+    The GIS CSV endpoint doesn't honor min/max_price params reliably, so we
+    fetch everything per ZIP and filter client-side at the end.
     """
     status = "9" if listing_type == "for_sale" else "130"
     zips   = zip_codes if zip_codes is not None else list(CHARLOTTE_ZIP_REGIONS.keys())
@@ -122,8 +287,6 @@ def scrape_redfin_charlotte(
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
 
-    # ── Step 1: warm-up visit to set session cookies ────────────────────────
-    # Use Mecklenburg County page — stable URL that reliably returns 200.
     try:
         warm = session.get(
             "https://www.redfin.com/county/2066/NC/Mecklenburg-County", timeout=20
@@ -133,29 +296,22 @@ def scrape_redfin_charlotte(
     except Exception as exc:
         logger.warning("[redfin] warm-up failed: %s", exc)
 
-    # ── Step 2: fetch CSV for each ZIP ──────────────────────────────────────
     all_listings: list[dict] = []
     seen_urls:    set[str]   = set()
 
-    for zipcode in zips:
+    for zip_idx, zipcode in enumerate(zips, 1):
+        _emit_progress(progress_cb, zip_idx, len(zips), f"ZIP {zipcode}")
         region_id = CHARLOTTE_ZIP_REGIONS.get(zipcode)
         if not region_id:
             continue
 
         for page in range(1, max_pages + 1):
             params = {
-                "al":          1,
-                "market":      "charlotte",
-                "num_homes":   200,
-                "ord":         "redfin-recommended-asc",
-                "page_number": page,
-                "region_id":   region_id,
-                "region_type": 2,
-                "status":      status,
-                "uipt":        "1,2,3,4,5,6,7,8",
-                "v":           8,
+                "al": 1, "market": "charlotte", "num_homes": 200,
+                "ord": "redfin-recommended-asc", "page_number": page,
+                "region_id": region_id, "region_type": 2,
+                "status": status, "uipt": "1,2,3,4,5,6,7,8", "v": 8,
             }
-
             try:
                 resp = session.get(
                     "https://www.redfin.com/stingray/api/gis-csv",
@@ -177,10 +333,9 @@ def scrape_redfin_charlotte(
                 break
             all_listings.extend(rows)
             logger.info("[redfin] ZIP %s page %d: %d listings", zipcode, page, len(rows))
-
-            # Polite delay between ZIP requests
             time.sleep(random.uniform(1.5, 3.0))
 
+    all_listings = _apply_price_filter(all_listings, min_price, max_price)
     logger.info("[redfin] total scraped: %d listings", len(all_listings))
     return all_listings
 
@@ -191,15 +346,7 @@ def _parse_redfin_csv(
     scraped_at: str,
     seen_urls: set[str],
 ) -> list[dict]:
-    """
-    Parse Redfin GIS CSV.
-
-    The first line is the header (starts with 'SALE TYPE').
-    Any line starting with a double-quote is a Redfin disclaimer and is skipped.
-    """
     lines = raw.splitlines()
-
-    # Locate header row
     header_idx = next(
         (i for i, ln in enumerate(lines) if ln.upper().startswith("SALE TYPE")),
         None,
@@ -207,7 +354,6 @@ def _parse_redfin_csv(
     if header_idx is None:
         return []
 
-    # Drop disclaimer lines (wrapped in double quotes)
     data_lines = [
         ln for ln in lines[header_idx + 1:]
         if ln.strip() and not ln.startswith('"')
@@ -218,7 +364,6 @@ def _parse_redfin_csv(
     csv_text = lines[header_idx] + "\n" + "\n".join(data_lines)
     reader   = csv.DictReader(io.StringIO(csv_text))
 
-    # The URL column has a very long name — find it once
     url_key: str | None = None
     out: list[dict] = []
 
@@ -231,6 +376,7 @@ def _parse_redfin_csv(
         address  = (row.get("ADDRESS")              or "").strip()
         city_raw = (row.get("CITY")                 or "").strip()
         state    = (row.get("STATE OR PROVINCE")    or "").strip()
+        zipcode  = (row.get("ZIP OR POSTAL CODE")   or "").strip()
         price    = (row.get("PRICE")                or "").strip()
         beds     = (row.get("BEDS")                 or "").strip()
         baths    = (row.get("BATHS")                or "").strip()
@@ -240,20 +386,17 @@ def _parse_redfin_csv(
         prop_raw = (row.get("PROPERTY TYPE")        or "").strip().lower()
         status   = (row.get("STATUS")               or "").strip().lower()
 
-        # Skip non-active or duplicate listings
-        if not address or not url:
-            continue
-        if url in seen_urls:
+        if not address or not url or url in seen_urls:
             continue
         if status and status not in ("active", "active contingent", "coming soon"):
             continue
 
+        zip_clean = _extract_zip(zipcode, address)
         seen_urls.add(url)
-
         out.append({
-            "title":         f"{address} – {city_raw}, {state}",
+            "title":         f"{address}{_DASH}{city_raw}, {state} {zip_clean}".rstrip(),
             "price":         price,
-            "location":      f"{address}, {city_raw}, {state}",
+            "location":      f"{address}, {city_raw}, {state} {zip_clean}".rstrip(),
             "bedrooms":      _norm_beds(beds),
             "bathrooms":     _norm_baths(baths),
             "sqft":          _norm_sqft(sqft_raw),
@@ -262,6 +405,7 @@ def _parse_redfin_csv(
             "date_scraped":  scraped_at,
             "source":        "redfin",
             "city":          _norm_city(city_raw),
+            "zip":           zip_clean,
             "listing_type":  listing_type,
             "property_type": prop_raw,
         })
@@ -270,440 +414,446 @@ def _parse_redfin_csv(
 
 
 # ---------------------------------------------------------------------------
-# Normalisation helpers
+# Realtor.com scraper (SeleniumBase UC + JSON-LD)
 # ---------------------------------------------------------------------------
-
-# Known Charlotte-metro city names used to strip builder code prefixes
-# (new-construction listings sometimes have a code like "p16mo9 weddington")
-_KNOWN_CITIES: set[str] = {
-    "charlotte", "matthews", "pineville", "huntersville", "mint hill",
-    "cornelius", "davidson", "concord", "harrisburg", "stallings",
-    "weddington", "waxhaw", "fort mill", "rock hill", "lake wylie",
-    "ballantyne", "belmont", "mooresville", "denver", "iron station",
-    "mount holly", "gastonia", "kannapolis", "indian trail", "marvin",
-    "monroe", "wesley chapel", "cramerton", "lowell", "bessemer city",
-    "uninc",
-}
-
-
-def _norm_city(val: str) -> str:
-    """Return a clean lower-case city name, stripping any builder code prefix."""
-    city = val.strip().lower()
-    if not city:
-        return "charlotte"
-    if city in _KNOWN_CITIES:
-        return city
-    # Strip leading code word (e.g. "p16mo9 weddington" → "weddington")
-    parts = city.split(" ", 1)
-    if len(parts) == 2 and parts[1] in _KNOWN_CITIES:
-        return parts[1]
-    return city
-
-
-def _norm_beds(val: str) -> str:
-    v = val.strip()
-    if v and v not in ("—", "N/A"):
-        try:
-            return str(int(float(v)))
-        except ValueError:
-            return v
-    return ""
-
-
-def _norm_baths(val: str) -> str:
-    v = val.strip()
-    if v and v not in ("—", "N/A"):
-        try:
-            n = float(v)
-            return str(int(n)) if n == int(n) else str(n)
-        except ValueError:
-            return v
-    return ""
-
-
-def _norm_sqft(val: str) -> str:
-    v = val.strip().replace(",", "")
-    if v and v not in ("—", "N/A"):
-        try:
-            return str(int(float(v)))
-        except ValueError:
-            return v
-    return ""
-
-
-# ---------------------------------------------------------------------------
-# Realtor.com scraper
-# ---------------------------------------------------------------------------
-
-_REALTOR_HEADERS = {
-    **_HEADERS,
-    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Sec-Fetch-Dest":  "document",
-    "Sec-Fetch-Mode":  "navigate",
-    "Sec-Fetch-Site":  "none",
-    "Upgrade-Insecure-Requests": "1",
-}
 
 _REALTOR_BASE = "https://www.realtor.com"
+
+# Charlotte metro area slugs — covers the full market, not just city limits.
+# One browser session is reused across all cities to avoid repeated cold starts.
+_REALTOR_METRO_CITIES = [
+    "Charlotte_NC",
+    "Matthews_NC",
+    "Huntersville_NC",
+    "Mint-Hill_NC",
+    "Pineville_NC",
+    "Concord_NC",
+    "Cornelius_NC",
+    "Davidson_NC",
+    "Weddington_NC",
+    "Indian-Trail_NC",
+    "Stallings_NC",
+    "Gastonia_NC",
+]
 
 
 def scrape_realtor_charlotte(
     listing_type: str = "for_sale",
     max_pages: int = 3,
+    min_price: int | None = None,
+    max_price: int | None = None,
+    progress_cb=None,
 ) -> list[dict]:
     """
-    Scrape Realtor.com for Charlotte, NC listings using __NEXT_DATA__ JSON.
+    Scrape Realtor.com for Charlotte metro listings.
 
-    Realtor.com embeds full listing data in a <script id="__NEXT_DATA__"> tag.
-    If the site returns 429 (rate limited) the function returns an empty list
-    and logs a warning rather than raising.
+    Iterates over _REALTOR_METRO_CITIES within a single browser session so
+    we cover the full metro area — not just the Charlotte city-limits page.
+    Price filter is pushed into the URL path so every result is in-band.
     """
-    search_slug = "Charlotte_NC" if listing_type == "for_sale" else "Charlotte_NC"
     path_prefix = "realestateandhomes-search" if listing_type == "for_sale" else "apartments"
     now = datetime.now(timezone.utc).isoformat()
 
-    session = requests.Session()
-    session.headers.update(_REALTOR_HEADERS)
+    if min_price is not None or max_price is not None:
+        lo = min_price if min_price is not None else 0
+        hi = max_price if max_price is not None else 50_000_000
+        price_seg = f"/price-{lo}-{hi}"
+    else:
+        price_seg = ""
+
+    cities = _REALTOR_METRO_CITIES
+    total_steps = len(cities) * max_pages
 
     all_listings: list[dict] = []
     seen_urls:    set[str]   = set()
+    step = 0
 
-    for page in range(1, max_pages + 1):
-        url = f"{_REALTOR_BASE}/{path_prefix}/{search_slug}/pg-{page}"
-        try:
-            resp = session.get(url, timeout=25)
-        except Exception as exc:
-            logger.warning("[realtor] request failed page %d: %s", page, exc)
-            break
+    try:
+        with _open_uc_session() as sb:
+            for city_slug in cities:
+                for page in range(1, max_pages + 1):
+                    step += 1
+                    _emit_progress(progress_cb, step, total_steps,
+                                   f"{city_slug.replace('_NC','').replace('-',' ')} p{page}")
+                    page_seg = "" if page == 1 else f"/pg-{page}"
+                    url = f"{_REALTOR_BASE}/{path_prefix}/{city_slug}{price_seg}{page_seg}"
+                    try:
+                        sb.uc_open_with_reconnect(url, reconnect_time=_SB_RECONNECT)
+                        sb.sleep(4)
+                    except Exception as exc:
+                        logger.warning("[realtor] nav failed %s p%d: %s", city_slug, page, exc)
+                        break
 
-        if resp.status_code == 429:
-            logger.warning(
-                "[realtor] rate-limited (429) on page %d — "
-                "Realtor.com is blocking automated requests. "
-                "Try again later or use a different source.",
-                page,
-            )
-            break
-        if resp.status_code != 200:
-            logger.warning("[realtor] unexpected status %d on page %d", resp.status_code, page)
-            break
+                    html = sb.get_page_source()
+                    rows = _parse_realtor_html(html, listing_type, now, seen_urls)
+                    if not rows:
+                        logger.info("[realtor] no listings %s p%d — next city", city_slug, page)
+                        break
+                    all_listings.extend(rows)
+                    logger.info("[realtor] %s p%d: %d listings (total %d)",
+                                city_slug, page, len(rows), len(all_listings))
+                    time.sleep(random.uniform(2.0, 3.5))
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        logger.error("[realtor] browser session failed: %s", exc)
 
-        # Extract __NEXT_DATA__ JSON
-        m = re.search(
-            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
-            resp.text,
-            re.DOTALL,
-        )
-        if not m:
-            logger.warning("[realtor] no __NEXT_DATA__ found on page %d", page)
-            break
-
-        try:
-            data = json.loads(m.group(1))
-        except Exception:
-            logger.warning("[realtor] failed to parse __NEXT_DATA__ on page %d", page)
-            break
-
-        rows = _parse_realtor_next_data(data, listing_type, now, seen_urls)
-        if not rows:
-            logger.info("[realtor] no listings on page %d — stopping", page)
-            break
-
-        all_listings.extend(rows)
-        logger.info("[realtor] page %d: %d listings", page, len(rows))
-        time.sleep(random.uniform(3.0, 5.0))
-
+    all_listings = _apply_price_filter(all_listings, min_price, max_price)
     logger.info("[realtor] total scraped: %d listings", len(all_listings))
     return all_listings
 
 
-def _parse_realtor_next_data(
-    data: dict,
+def _parse_realtor_html(
+    html: str,
     listing_type: str,
     scraped_at: str,
     seen_urls: set[str],
 ) -> list[dict]:
-    """Extract listings from Realtor.com __NEXT_DATA__ JSON."""
-    # Common paths for listing results
-    page_props = data.get("props", {}).get("pageProps", {})
+    """
+    Parse Realtor.com search results.
 
-    # Try several known JSON paths used by Realtor.com
-    results: list = []
-    for path in [
-        ["searchResults", "home_search", "results"],
-        ["searchResults", "results"],
-        ["properties"],
-        ["homes"],
-    ]:
-        node = page_props
-        for key in path:
-            if isinstance(node, dict):
-                node = node.get(key)
-            else:
-                node = None
-                break
-        if isinstance(node, list) and node:
-            results = node
-            break
+    Tries JSON-LD first (clean structured data); falls back to DOM card
+    parsing when JSON-LD is absent or returns nothing.
+    """
+    rows = _parse_realtor_jsonld(html, listing_type, scraped_at, seen_urls)
+    if rows:
+        return rows
+    return _parse_realtor_dom(html, listing_type, scraped_at, seen_urls)
+
+
+def _parse_realtor_jsonld(
+    html: str,
+    listing_type: str,
+    scraped_at: str,
+    seen_urls: set[str],
+) -> list[dict]:
+    soup = BeautifulSoup(html, "lxml")
+    items: list[dict] = []
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except Exception:
+            continue
+        entries = data if isinstance(data, list) else [data]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            main = entry.get("mainEntity")
+            if isinstance(main, dict) and main.get("@type") == "ItemList":
+                items.extend(main.get("itemListElement", []))
 
     out: list[dict] = []
-    for item in results:
-        loc    = item.get("location", {}) or {}
-        addr   = loc.get("address", {}) or {}
-        desc   = item.get("description", {}) or {}
+    for it in items:
+        url   = (it.get("url") or "").strip()
+        name  = (it.get("name") or "").strip()
+        offer = it.get("offers") or {}
+        ent   = it.get("mainEntity") or {}
+        addr  = ent.get("address") or {}
+        floor = ent.get("floorSize") or {}
 
-        address  = addr.get("line", "")
-        city_raw = addr.get("city", "")
-        state    = addr.get("state_code", "NC")
-        price    = str(item.get("list_price", item.get("price", "")) or "")
-        beds     = str(desc.get("beds", "") or "")
-        baths    = str(desc.get("baths_consolidated", desc.get("baths", "")) or "")
-        sqft     = str(desc.get("sqft", "") or "")
-        prop_raw = (desc.get("type", "") or "").lower()
-        listed   = item.get("list_date", "")
-        status   = (item.get("status", "") or "").lower()
-        permalink = item.get("permalink", "")
-        url      = f"{_REALTOR_BASE}{permalink}" if permalink else ""
+        if not url or not name or url in seen_urls:
+            continue
 
-        if not address or not url:
-            continue
-        if url in seen_urls:
-            continue
-        if status and status not in ("for_sale", "active", "for_rent", ""):
-            continue
+        prop_type_raw = ent.get("@type") or ""
+        if isinstance(prop_type_raw, list):
+            prop_type_raw = prop_type_raw[0] if prop_type_raw else ""
+        prop_type = _camel_to_words(prop_type_raw).lower()
+
+        street   = (addr.get("streetAddress") or "").strip()
+        city_raw = (addr.get("addressLocality") or "Charlotte").strip()
+        state    = (addr.get("addressRegion") or "NC").strip()
+        zip_clean = _extract_zip(addr.get("postalCode"), name, url)
+        full_addr = street or name
 
         seen_urls.add(url)
         out.append({
-            "title":         f"{address} \u2013 {city_raw}, {state}",
-            "price":         price,
-            "location":      f"{address}, {city_raw}, {state}",
-            "bedrooms":      _norm_beds(beds),
-            "bathrooms":     _norm_baths(baths),
-            "sqft":          _norm_sqft(sqft),
+            "title":         f"{full_addr}{_DASH}{city_raw}, {state} {zip_clean}".rstrip(),
+            "price":         str(offer.get("price") or ""),
+            "location":      f"{full_addr}, {city_raw}, {state} {zip_clean}".rstrip(),
+            "bedrooms":      _norm_beds(str(ent.get("numberOfBedrooms") or "")),
+            "bathrooms":     _norm_baths(str(ent.get("numberOfBathroomsTotal") or "")),
+            "sqft":          _norm_sqft(str(floor.get("value") or "")),
             "url":           url,
-            "date_posted":   listed,
+            "date_posted":   "",
             "date_scraped":  scraped_at,
             "source":        "realtor",
             "city":          _norm_city(city_raw),
+            "zip":           zip_clean,
             "listing_type":  listing_type,
-            "property_type": prop_raw,
+            "property_type": prop_type,
         })
 
     return out
 
 
-# ---------------------------------------------------------------------------
-# Zillow scraper (Playwright headless browser)
-# ---------------------------------------------------------------------------
-
-_ZILLOW_BASE = "https://www.zillow.com"
-_ZILLOW_UA   = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-
-
-def scrape_zillow_charlotte(
-    listing_type: str = "for_sale",
-    max_pages: int = 3,
-) -> list[dict]:
-    """
-    Scrape Zillow for Charlotte, NC listings using a headless Chromium browser.
-
-    Playwright intercepts Zillow's internal GetSearchPageState API responses
-    which contain full JSON listing data, bypassing PerimeterX bot detection.
-
-    Requires: `python -m playwright install chromium` (one-time setup).
-    """
-    try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    except ImportError:
-        raise RuntimeError(
-            "Playwright is not installed. Run: pip install playwright"
-        )
-
-    # playwright-stealth applies comprehensive fingerprint spoofing
-    try:
-        from playwright_stealth import stealth_sync as _stealth_fn
-        logger.info("[zillow] playwright-stealth loaded")
-    except ImportError:
-        _stealth_fn = None
-        logger.warning("[zillow] playwright-stealth not installed; bot detection may block scraping")
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    if listing_type == "for_rent":
-        base_path = "charlotte-nc/rentals"
-    else:
-        base_path = "charlotte-nc"
-
-    all_listings: list[dict] = []
-    seen_urls:    set[str]   = set()
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-accelerated-2d-canvas",
-                    "--no-first-run",
-                    "--no-zygote",
-                    "--disable-gpu",
-                ],
-            )
-            context = browser.new_context(
-                user_agent=_ZILLOW_UA,
-                viewport={"width": 1920, "height": 1080},
-                locale="en-US",
-                timezone_id="America/New_York",
-                java_script_enabled=True,
-                accept_downloads=False,
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    "Upgrade-Insecure-Requests": "1",
-                    "Sec-Fetch-Dest":  "document",
-                    "Sec-Fetch-Mode":  "navigate",
-                    "Sec-Fetch-Site":  "none",
-                },
-            )
-            # Remove navigator.webdriver fingerprint at context level
-            context.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-            )
-
-            for pg in range(1, max_pages + 1):
-                path    = f"{base_path}/{pg}_p/" if pg > 1 else f"{base_path}/"
-                url     = f"{_ZILLOW_BASE}/{path}"
-                captured: list[dict] = []
-
-                def _on_response(response, _captured=captured):
-                    if "GetSearchPageState" in response.url and response.status == 200:
-                        try:
-                            _captured.append(response.json())
-                        except Exception:
-                            pass
-
-                page = context.new_page()
-                # Apply comprehensive stealth patches before navigation
-                if _stealth_fn:
-                    try:
-                        _stealth_fn(page)
-                    except Exception as se:
-                        logger.debug("[zillow] stealth patch error: %s", se)
-                page.on("response", _on_response)
-
-                try:
-                    # Use "load" instead of "networkidle" — PerimeterX challenges
-                    # keep connections open, preventing networkidle from settling.
-                    page.goto(url, wait_until="load", timeout=40000)
-                    # Wait for async GetSearchPageState API call to complete
-                    page.wait_for_timeout(7000)
-                except PWTimeout:
-                    logger.warning("[zillow] page %d timed out, using what was captured", pg)
-                except Exception as exc:
-                    logger.warning("[zillow] navigation error page %d: %s", pg, exc)
-
-                page.close()
-
-                if not captured:
-                    logger.warning("[zillow] no API response captured on page %d", pg)
-                    break
-
-                rows = _parse_zillow_response(captured[-1], listing_type, now, seen_urls)
-                if not rows:
-                    logger.info("[zillow] page %d returned 0 listings — stopping", pg)
-                    break
-
-                all_listings.extend(rows)
-                logger.info("[zillow] page %d: %d listings", pg, len(rows))
-
-                if pg < max_pages:
-                    page_wait = context.new_page()
-                    page_wait.wait_for_timeout(random.randint(3000, 5500))
-                    page_wait.close()
-
-            browser.close()
-
-    except Exception as exc:
-        # Surface the error cleanly — don't silently return empty
-        msg = str(exc)
-        if "Executable doesn't exist" in msg or "chromium" in msg.lower():
-            raise RuntimeError(
-                "Zillow scraper requires Playwright browsers. "
-                "Run: python -m playwright install chromium"
-            ) from exc
-        raise
-
-    logger.info("[zillow] total scraped: %d listings", len(all_listings))
-    return all_listings
-
-
-def _parse_zillow_response(
-    data: dict,
+def _parse_realtor_dom(
+    html: str,
     listing_type: str,
     scraped_at: str,
     seen_urls: set[str],
 ) -> list[dict]:
-    """Extract listings from a Zillow GetSearchPageState JSON response."""
-    # Try common paths for listing results
+    """
+    Fallback DOM parser for Realtor.com — scrapes listing cards directly.
+    Handles the `data-testid="property-card"` pattern used in current builds.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    out: list[dict] = []
+
+    cards = (
+        soup.select('[data-testid="property-card"]')
+        or soup.select('[class*="PropertyCard"]')
+        or soup.select('[class*="property-card"]')
+    )
+
+    for card in cards:
+        # URL
+        a_tag = card.find("a", href=True)
+        if not a_tag:
+            continue
+        href = a_tag["href"].strip()
+        if not href.startswith("http"):
+            href = _REALTOR_BASE + href
+        if href in seen_urls:
+            continue
+
+        # Price
+        price_el = (
+            card.select_one('[data-testid="pc-price"]')
+            or card.select_one('[class*="Price"]')
+            or card.find(class_=re.compile(r"price", re.I))
+        )
+        price_raw = ""
+        if price_el:
+            pm = re.search(r"\$([\d,]+)", price_el.get_text())
+            price_raw = pm.group(1).replace(",", "") if pm else ""
+
+        # Address
+        addr_el = (
+            card.select_one('[data-testid="card-address-1"]')
+            or card.select_one('[data-testid="card-address"]')
+            or card.find(class_=re.compile(r"address", re.I))
+        )
+        addr2_el = card.select_one('[data-testid="card-address-2"]')
+        street   = addr_el.get_text(strip=True) if addr_el else ""
+        city_state_zip = addr2_el.get_text(strip=True) if addr2_el else ""
+
+        # Parse "Charlotte, NC 28203" or "Charlotte, NC"
+        csz_parts = city_state_zip.replace(",", " ").split()
+        city_raw  = csz_parts[0] if csz_parts else "Charlotte"
+        zip_clean = _extract_zip(city_state_zip, href)
+
+        # Beds / baths / sqft
+        beds = baths = sqft = ""
+        for li in card.select('[data-testid*="bed"], [data-testid*="bath"], [data-testid*="sqft"]'):
+            t  = li.get("data-testid", "")
+            v  = re.search(r"[\d,.]+", li.get_text())
+            if not v:
+                continue
+            if "bed" in t:
+                beds = v.group()
+            elif "bath" in t:
+                baths = v.group()
+            elif "sqft" in t:
+                sqft = v.group().replace(",", "")
+
+        # Property type
+        prop_el = card.find(class_=re.compile(r"(property.?type|prop.?type)", re.I))
+        prop_type = prop_el.get_text(strip=True).lower() if prop_el else ""
+
+        full_addr = f"{street}, {city_state_zip}".strip(", ")
+        seen_urls.add(href)
+        out.append({
+            "title":         full_addr or street,
+            "price":         price_raw,
+            "location":      full_addr,
+            "bedrooms":      _norm_beds(beds),
+            "bathrooms":     _norm_baths(baths),
+            "sqft":          _norm_sqft(sqft),
+            "url":           href,
+            "date_posted":   "",
+            "date_scraped":  scraped_at,
+            "source":        "realtor",
+            "city":          _norm_city(city_raw),
+            "zip":           zip_clean,
+            "listing_type":  listing_type,
+            "property_type": prop_type,
+        })
+
+    return out
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Zillow scraper (SeleniumBase UC + __NEXT_DATA__)
+# ---------------------------------------------------------------------------
+
+_ZILLOW_BASE = "https://www.zillow.com"
+
+
+def scrape_zillow_charlotte(
+    listing_type: str = "for_sale",
+    max_pages: int = 1,
+    min_price: int | None = None,
+    max_price: int | None = None,
+    progress_cb=None,
+    zip_subset: list[int] | None = None,
+) -> tuple[list[dict], list[int]]:
+    """
+    Scrape Zillow for Charlotte, NC listings.
+
+    Parameters
+    ----------
+    zip_subset : list[int] | None
+        If given, only scrape these ZIPs (used by the rotation system so each
+        run covers a manageable slice rather than all 27 ZIPs at once, which
+        triggers Zillow's IP-level rate limiter after the first ZIP).
+
+    Returns
+    -------
+    (listings, succeeded_zips)
+        succeeded_zips contains only the ZIPs that returned at least one
+        page of real results — blocked ZIPs are excluded so the caller can
+        decide whether to mark them as scraped or leave them at the front of
+        the queue for the next run.
+    """
+    path_prefix = "homes/for_rent" if listing_type == "for_rent" else "homes"
+    now = datetime.now(timezone.utc).isoformat()
+    zips = zip_subset if zip_subset is not None else list(CHARLOTTE_ZIP_REGIONS.keys())
+
+    if min_price is not None or max_price is not None:
+        lo = min_price if min_price is not None else 0
+        hi = max_price if max_price is not None else 50_000_000
+        price_seg = f"{lo}-{hi}_price/"
+    else:
+        price_seg = ""
+
+    all_listings: list[dict] = []
+    seen_urls:    set[str]   = set()
+    succeeded_zips: list[int] = []
+
+    def _scrape_zip(sb, zipcode: int, idx: int, total: int) -> tuple[list[dict], bool]:
+        """Fetch one ZIP; returns (rows, was_blocked)."""
+        url = f"{_ZILLOW_BASE}/{path_prefix}/{zipcode}_rb/{price_seg}"
+        for attempt in range(1, 3):
+            try:
+                sb.uc_open_with_reconnect(url, reconnect_time=_SB_RECONNECT)
+                sb.sleep(3 if attempt == 1 else 8)
+            except Exception as exc:
+                logger.warning("[zillow] ZIP %s attempt %d nav failed: %s", zipcode, attempt, exc)
+                return [], True
+            html = sb.get_page_source()
+            if "Access to this page has been denied" in html or "__NEXT_DATA__" not in html:
+                logger.warning("[zillow] ZIP %s attempt %d bot-blocked; retrying…", zipcode, attempt)
+                time.sleep(random.uniform(8.0, 12.0))
+                continue
+            rows = _parse_zillow_next_data(html, listing_type, now, seen_urls)
+            logger.info("[zillow] ZIP %s (%d/%d): %d listings (total so far %d)",
+                        zipcode, idx, total, len(rows), len(all_listings) + len(rows))
+            return rows, False
+        logger.warning("[zillow] ZIP %s blocked on both attempts — skipped this run", zipcode)
+        return [], True
+
+    # Each ZIP gets its own fresh browser session so Zillow never sees
+    # consecutive requests from the same session fingerprint.
+    for idx, zipcode in enumerate(zips, 1):
+        _emit_progress(progress_cb, idx, len(zips), f"ZIP {zipcode}")
+        try:
+            with _open_uc_session() as sb:
+                rows, blocked = _scrape_zip(sb, zipcode, idx, len(zips))
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            logger.error("[zillow] ZIP %s session error: %s", zipcode, exc)
+            blocked = True
+            rows = []
+
+        if not blocked:
+            all_listings.extend(rows)
+            succeeded_zips.append(zipcode)
+
+        # Brief pause between browser launches so Chrome/Zillow don't overlap
+        if idx < len(zips):
+            time.sleep(random.uniform(3.0, 6.0))
+
+    all_listings = _apply_price_filter(all_listings, min_price, max_price)
+    logger.info("[zillow] done: %d listings from %d/%d ZIPs succeeded",
+                len(all_listings), len(succeeded_zips), len(zips))
+    return all_listings, succeeded_zips
+
+
+def _parse_zillow_next_data(
+    html: str,
+    listing_type: str,
+    scraped_at: str,
+    seen_urls: set[str],
+) -> list[dict]:
+    soup = BeautifulSoup(html, "lxml")
+    nd   = soup.find("script", id="__NEXT_DATA__")
+    if not nd or not nd.string:
+        return []
+    try:
+        data = json.loads(nd.string)
+    except Exception:
+        return []
+
+    # Locate the list of results — known path on current Zillow.
     results: list = []
-    for path in [
-        ["cat1", "searchResults", "listResults"],
-        ["cat2", "searchResults", "listResults"],
-        ["mapResults"],
-    ]:
-        node = data
-        for key in path:
-            node = node.get(key) if isinstance(node, dict) else None
-        if isinstance(node, list) and node:
-            results = node
-            break
+    try:
+        sps = data["props"]["pageProps"]["searchPageState"]
+        for cat in ("cat1", "cat2"):
+            node = sps.get(cat, {}).get("searchResults", {})
+            for key in ("listResults", "mapResults"):
+                v = node.get(key)
+                if isinstance(v, list) and v:
+                    results = v
+                    break
+            if results:
+                break
+    except (KeyError, TypeError):
+        pass
 
     out: list[dict] = []
     for item in results:
         address  = (item.get("addressStreet") or "").strip()
         city_raw = (item.get("addressCity")   or "").strip()
         state    = (item.get("addressState")  or "NC").strip()
+        zip_clean = _extract_zip(item.get("addressZipcode"), item.get("address"))
         price    = str(item.get("unformattedPrice") or item.get("price") or "")
         beds     = str(item.get("beds")  or "")
         baths    = str(item.get("baths") or "")
         sqft     = str(item.get("area")  or "")
         detail   = (item.get("detailUrl") or "").strip()
-        prop_raw = (item.get("propertyType") or "").lower().replace("_", " ")
-        listed   = ""  # Zillow doesn't expose raw date in this endpoint
+        prop_raw = (item.get("propertyType") or item.get("hdpData", {})
+                                                   .get("homeInfo", {})
+                                                   .get("homeType")
+                                                   or "").lower().replace("_", " ")
 
-        # Skip non-residential / non-Charlotte results
         if not address or not detail:
             continue
         url = detail if detail.startswith("http") else f"{_ZILLOW_BASE}{detail}"
         if url in seen_urls:
             continue
 
-        # Skip sold/off-market
         status = (item.get("statusType") or "").upper()
         if status in ("RECENTLY_SOLD", "OTHER"):
             continue
 
         seen_urls.add(url)
         out.append({
-            "title":         f"{address} \u2013 {city_raw}, {state}",
+            "title":         f"{address}{_DASH}{city_raw}, {state} {zip_clean}".rstrip(),
             "price":         price,
-            "location":      f"{address}, {city_raw}, {state}",
+            "location":      f"{address}, {city_raw}, {state} {zip_clean}".rstrip(),
             "bedrooms":      _norm_beds(beds),
             "bathrooms":     _norm_baths(baths),
             "sqft":          _norm_sqft(sqft),
             "url":           url,
-            "date_posted":   listed,
+            "date_posted":   "",
             "date_scraped":  scraped_at,
             "source":        "zillow",
             "city":          _norm_city(city_raw),
+            "zip":           zip_clean,
             "listing_type":  listing_type,
             "property_type": prop_raw,
         })
@@ -712,7 +862,140 @@ def _parse_zillow_response(
 
 
 # ---------------------------------------------------------------------------
-# Estately scraper
+# Apartments.com scraper (SeleniumBase UC + DOM placards)
+# ---------------------------------------------------------------------------
+
+_APTS_BASE = "https://www.apartments.com"
+
+
+def scrape_apartments_charlotte(
+    listing_type: str = "for_rent",
+    max_pages: int = 3,
+    min_price: int | None = None,
+    max_price: int | None = None,
+    progress_cb=None,
+) -> list[dict]:
+    """
+    Scrape Apartments.com for Charlotte, NC rentals.
+
+    Apartments.com only carries rentals — `for_sale` returns an empty list.
+    Uses SeleniumBase UC to load each search page, then parses each
+    `<article class="placard">` block in the rendered DOM.
+    """
+    if listing_type != "for_rent":
+        logger.info("[apartments] only supports for_rent; skipping for_sale request")
+        return []
+
+    now = datetime.now(timezone.utc).isoformat()
+    all_listings: list[dict] = []
+    seen_urls:    set[str]   = set()
+
+    try:
+        with _open_uc_session() as sb:
+            for pg in range(1, max_pages + 1):
+                _emit_progress(progress_cb, pg, max_pages, f"page {pg}")
+                path = "charlotte-nc/" if pg == 1 else f"charlotte-nc/{pg}/"
+                url  = f"{_APTS_BASE}/{path}"
+                try:
+                    sb.uc_open_with_reconnect(url, reconnect_time=_SB_RECONNECT)
+                    sb.sleep(4)
+                except Exception as exc:
+                    logger.warning("[apartments] navigation failed page %d: %s", pg, exc)
+                    break
+
+                html = sb.get_page_source()
+                rows = _parse_apartments_placards(html, now, seen_urls)
+                if not rows:
+                    logger.info("[apartments] no placards on page %d — stopping", pg)
+                    break
+                all_listings.extend(rows)
+                logger.info("[apartments] page %d: %d listings", pg, len(rows))
+                time.sleep(random.uniform(2.0, 3.5))
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        logger.error("[apartments] browser session failed: %s", exc)
+
+    all_listings = _apply_price_filter(all_listings, min_price, max_price)
+    logger.info("[apartments] total scraped: %d listings", len(all_listings))
+    return all_listings
+
+
+def _parse_apartments_placards(
+    html: str,
+    scraped_at: str,
+    seen_urls: set[str],
+) -> list[dict]:
+    soup = BeautifulSoup(html, "lxml")
+    placards = soup.select("article.placard")
+    out: list[dict] = []
+
+    for p in placards:
+        url      = (p.get("data-url") or "").strip()
+        if not url or url in seen_urls:
+            continue
+
+        title_el = p.select_one(".js-placardTitle, .property-title")
+        addr_el  = p.select_one(".property-address")
+        title    = title_el.get_text(strip=True) if title_el else ""
+        addr_txt = addr_el.get_text(strip=True) if addr_el else (p.get("data-streetaddress") or "")
+
+        # Pull minimum price + bedroom count out of the .rentRollup table
+        prices: list[int] = []
+        beds_list: list[int] = []
+        for box in p.select(".bedRentBox"):
+            bed_txt   = (box.select_one(".bedTextBox") or "").get_text(strip=True) if box.select_one(".bedTextBox") else ""
+            price_txt = (box.select_one(".priceTextBox") or "").get_text(strip=True) if box.select_one(".priceTextBox") else ""
+            pm = re.search(r"\$([\d,]+)", price_txt)
+            if pm:
+                try:
+                    prices.append(int(pm.group(1).replace(",", "")))
+                except ValueError:
+                    pass
+            if bed_txt:
+                low = bed_txt.lower()
+                if "studio" in low:
+                    beds_list.append(0)
+                else:
+                    bm = re.match(r"(\d+)", low)
+                    if bm:
+                        beds_list.append(int(bm.group(1)))
+
+        price = str(min(prices)) if prices else ""
+        beds  = str(min(beds_list)) if beds_list else ""
+
+        # Address parts: "1100 Falls Creek Ln, Charlotte, NC 28209"
+        parts = [s.strip() for s in addr_txt.split(",")]
+        city_raw = parts[-2] if len(parts) >= 3 else "Charlotte"
+        state_zip = parts[-1] if len(parts) >= 3 else "NC"
+        state = state_zip.split(" ")[0] if state_zip else "NC"
+        zip_clean = _extract_zip(state_zip, addr_txt)
+        street = parts[0] if parts else addr_txt
+
+        display_title = title or street
+        seen_urls.add(url)
+        out.append({
+            "title":         f"{display_title}{_DASH}{city_raw}, {state} {zip_clean}".rstrip(),
+            "price":         price,
+            "location":      f"{street}, {city_raw}, {state} {zip_clean}".rstrip(),
+            "bedrooms":      beds,
+            "bathrooms":     "",
+            "sqft":          "",
+            "url":           url,
+            "date_posted":   "",
+            "date_scraped":  scraped_at,
+            "source":        "apartments",
+            "city":          _norm_city(city_raw),
+            "zip":           zip_clean,
+            "listing_type":  "for_rent",
+            "property_type": "apartment",
+        })
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Estately scraper (plain requests + BS4 — no bot protection)
 # ---------------------------------------------------------------------------
 
 _ESTATELY_BASE = "https://www.estately.com"
@@ -721,24 +1004,21 @@ _ESTATELY_BASE = "https://www.estately.com"
 def scrape_estately_charlotte(
     listing_type: str = "for_sale",
     max_pages: int = 5,
+    min_price: int | None = None,
+    max_price: int | None = None,
+    progress_cb=None,
 ) -> list[dict]:
-    """
-    Scrape Estately for Charlotte, NC listings.
-
-    Estately serves fully server-rendered HTML (Ruby on Rails app) with no
-    significant bot protection — standard requests + BeautifulSoup works fine.
-
-    Structure:
-      Container : div.full-height-padded-wrapper  (15 listings per page)
-      Address   : h2.result-address a             (href = listing URL)
-      Prop type : h2.result-address small
-      Price     : p.result-price strong
-      Details   : div.result-basics li            (<b>N</b> beds/baths/sqft)
-      Pagination: ?page=N  (up to page 18 visible; ~270 listings for sale)
-    """
+    """Scrape Estately for Charlotte, NC listings (server-rendered HTML)."""
     base_url = f"{_ESTATELY_BASE}/NC/Charlotte"
+    qs_parts: list[str] = []
     if listing_type == "for_rent":
-        base_url += "?only_rent=true"
+        qs_parts.append("only_rent=true")
+    if min_price is not None:
+        qs_parts.append(f"min_price={min_price}")
+    if max_price is not None:
+        qs_parts.append(f"max_price={max_price}")
+    if qs_parts:
+        base_url += "?" + "&".join(qs_parts)
         page_sep = "&"
     else:
         page_sep = "?"
@@ -756,6 +1036,7 @@ def scrape_estately_charlotte(
     seen_urls:    set[str]   = set()
 
     for pg in range(1, max_pages + 1):
+        _emit_progress(progress_cb, pg, max_pages, f"page {pg}")
         url = base_url if pg == 1 else f"{base_url}{page_sep}page={pg}"
         try:
             resp = session.get(url, timeout=25)
@@ -775,7 +1056,6 @@ def scrape_estately_charlotte(
 
         page_count = 0
         for item in wrappers:
-            # Address + URL
             addr_link = item.select_one("h2.result-address a")
             if not addr_link:
                 continue
@@ -788,20 +1068,16 @@ def scrape_estately_charlotte(
             if href in seen_urls:
                 continue
 
-            # Property type  ("House For Sale", "Condo For Sale", etc.)
             small_el = item.select_one("h2.result-address small")
             prop_raw = small_el.get_text(strip=True).lower() if small_el else ""
-            # Strip listing-type suffix ("for sale" / "for rent")
             prop_type = re.sub(r"\s*for\s+(sale|rent)$", "", prop_raw).strip()
 
-            # Price
             price_el = item.select_one("p.result-price strong")
             price_raw = (
                 price_el.get_text(strip=True).replace("$", "").replace(",", "")
                 if price_el else ""
             )
 
-            # Beds / baths / sqft from result-basics list items
             beds = baths = sqft = ""
             for li in item.select("div.result-basics li"):
                 bold = li.find("b")
@@ -816,9 +1092,9 @@ def scrape_estately_charlotte(
                 elif "sqft" in rest and "lot" not in rest and not sqft:
                     sqft = num.replace(",", "")
 
-            # Parse city from address "Street, City, State"
             parts    = [p.strip() for p in address_text.split(",")]
             city_raw = parts[-2] if len(parts) >= 3 else "Charlotte"
+            zip_clean = _extract_zip(parts[-1] if parts else "", address_text)
 
             seen_urls.add(href)
             all_listings.append({
@@ -833,6 +1109,7 @@ def scrape_estately_charlotte(
                 "date_scraped":  now,
                 "source":        "estately",
                 "city":          _norm_city(city_raw),
+                "zip":           zip_clean,
                 "listing_type":  listing_type,
                 "property_type": prop_type,
             })
@@ -841,12 +1118,13 @@ def scrape_estately_charlotte(
         logger.info("[estately] page %d: %d listings", pg, page_count)
         time.sleep(random.uniform(2.0, 3.5))
 
+    all_listings = _apply_price_filter(all_listings, min_price, max_price)
     logger.info("[estately] total scraped: %d listings", len(all_listings))
     return all_listings
 
 
 # ---------------------------------------------------------------------------
-# Craigslist scraper
+# Craigslist scraper (plain requests + BS4)
 # ---------------------------------------------------------------------------
 
 _CL_BASE = "https://charlotte.craigslist.org"
@@ -855,17 +1133,11 @@ _CL_BASE = "https://charlotte.craigslist.org"
 def scrape_craigslist_charlotte(
     listing_type: str = "for_sale",
     max_pages: int = 3,
+    min_price: int | None = None,
+    max_price: int | None = None,
+    progress_cb=None,
 ) -> list[dict]:
-    """
-    Scrape Craigslist Charlotte for housing listings.
-
-    For sale : /search/rea  (real estate — for sale by owner & broker)
-    For rent : /search/apa  (apartments / housing for rent)
-
-    Craigslist serves plain server-side HTML with no meaningful bot protection,
-    so standard requests + BeautifulSoup works reliably.
-    Each page returns up to 120 results; paginate with ?s=0, ?s=120, …
-    """
+    """Scrape Craigslist Charlotte for housing listings."""
     search_path = "/search/apa" if listing_type == "for_rent" else "/search/rea"
     now = datetime.now(timezone.utc).isoformat()
 
@@ -875,11 +1147,18 @@ def scrape_craigslist_charlotte(
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
 
+    price_qs = ""
+    if min_price is not None:
+        price_qs += f"&min_price={min_price}"
+    if max_price is not None:
+        price_qs += f"&max_price={max_price}"
+
     all_listings: list[dict] = []
     seen_urls:    set[str]   = set()
 
     for pg in range(max_pages):
-        url = f"{_CL_BASE}{search_path}?s={pg * 120}"
+        _emit_progress(progress_cb, pg + 1, max_pages, f"page {pg + 1}")
+        url = f"{_CL_BASE}{search_path}?s={pg * 120}{price_qs}"
         try:
             resp = session.get(url, timeout=20)
         except Exception as exc:
@@ -892,7 +1171,7 @@ def scrape_craigslist_charlotte(
 
         soup = BeautifulSoup(resp.text, "lxml")
 
-        # ── Parse JSON-LD for structured address / bed / bath data ──────────
+        # JSON-LD blocks supplement HTML with structured address / bed / bath
         ld_by_title: dict[str, dict] = {}
         for script in soup.find_all("script", type="application/ld+json"):
             try:
@@ -907,27 +1186,22 @@ def scrape_craigslist_charlotte(
             except Exception:
                 pass
 
-        # ── Parse HTML listing rows ─────────────────────────────────────────
-        # Craigslist has used multiple layouts over time; support all known variants.
         results = (
-            soup.select("li.cl-static-search-result")  # current (2025+)
-            or soup.select("li.cl-search-result")       # previous layout
-            or soup.select("li.result-row")             # old layout
+            soup.select("li.cl-static-search-result")
+            or soup.select("li.cl-search-result")
+            or soup.select("li.result-row")
         )
 
         if not results:
-            logger.info("[craigslist] no results found on page %d — stopping", pg + 1)
+            logger.info("[craigslist] no results on page %d — stopping", pg + 1)
             break
 
         page_count = 0
         for row in results:
-            # ── Current layout: <li title="..."><a href="..."><div class="title">...</div>
-            # ── Older layouts:  <li><a class="posting-title ...">
             link = row.find("a")
             if not link:
                 continue
 
-            # Title: prefer .title div text, fall back to li title attr, then link text
             title_div = row.select_one(".title")
             title = (
                 title_div.get_text(strip=True)
@@ -943,15 +1217,12 @@ def scrape_craigslist_charlotte(
             if href in seen_urls:
                 continue
 
-            # Price
             price_el = row.select_one(".price") or row.select_one(".result-price")
             price_raw = price_el.get_text(strip=True).replace("$", "").replace(",", "") if price_el else ""
 
-            # Beds / baths from housing blurb ("3br 2ba") — older layouts only
             housing_el = row.select_one(".housing") or row.select_one(".result-housing")
             beds, baths = _parse_cl_housing(housing_el.get_text() if housing_el else "")
 
-            # Neighborhood — new layout uses .location, old used .result-hood / .hood
             hood_el = (
                 row.select_one(".location")
                 or row.select_one(".result-hood")
@@ -959,11 +1230,9 @@ def scrape_craigslist_charlotte(
             )
             hood = hood_el.get_text(strip=True).strip("() ") if hood_el else ""
 
-            # Date
             date_el = row.select_one("time")
             date_posted = (date_el.get("datetime") or "")[:10] if date_el else ""
 
-            # Supplement with JSON-LD address if available
             ld = ld_by_title.get(title.lower()[:80], {})
             addr_obj  = ld.get("address") or {}
             locality  = addr_obj.get("addressLocality", "") if isinstance(addr_obj, dict) else ""
@@ -973,15 +1242,18 @@ def scrape_craigslist_charlotte(
             if not baths:
                 baths = str(ld.get("numberOfBathroomsTotal", "")) if ld.get("numberOfBathroomsTotal") else baths
 
-            city_raw = locality or hood or "Charlotte"
-            # Skip listings clearly outside the Charlotte metro
+            city_raw  = locality or hood or "Charlotte"
             city_norm = _norm_city(city_raw)
+            zip_clean = _extract_zip(
+                addr_obj.get("postalCode") if isinstance(addr_obj, dict) else "",
+                title, hood,
+            )
 
             seen_urls.add(href)
             all_listings.append({
                 "title":         title,
                 "price":         price_raw,
-                "location":      f"{city_raw}, {region}",
+                "location":      f"{city_raw}, {region}" + (f" {zip_clean}" if zip_clean else ""),
                 "bedrooms":      _norm_beds(str(beds)),
                 "bathrooms":     _norm_baths(str(baths)),
                 "sqft":          "",
@@ -990,6 +1262,7 @@ def scrape_craigslist_charlotte(
                 "date_scraped":  now,
                 "source":        "craigslist",
                 "city":          city_norm,
+                "zip":           zip_clean,
                 "listing_type":  listing_type,
                 "property_type": (ld.get("@type") or "").lower(),
             })
@@ -998,12 +1271,13 @@ def scrape_craigslist_charlotte(
         logger.info("[craigslist] page %d: %d listings", pg + 1, page_count)
         time.sleep(random.uniform(2.0, 3.5))
 
+    all_listings = _apply_price_filter(all_listings, min_price, max_price)
     logger.info("[craigslist] total scraped: %d listings", len(all_listings))
     return all_listings
 
 
 def _parse_cl_housing(text: str) -> tuple[str, str]:
-    """Parse Craigslist housing blurb '3br 2ba' → ('3', '2')."""
+    """Parse Craigslist housing blurb '3br 2ba' -> ('3', '2')."""
     beds  = ""
     baths = ""
     bed_m  = re.search(r"(\d+)\s*[Bb][Rr]", text)
@@ -1016,6 +1290,152 @@ def _parse_cl_housing(text: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# SearchCharlotte.com (Berkshire Hathaway / BoomTown IDX) scraper
+# ---------------------------------------------------------------------------
+#
+# Server-rendered HTML, no bot protection. 10 listings per page, paginate
+# with ?pageIndex=N. 27k+ active listings, so even max_pages=30 only pulls
+# ~300 of them. URL format already contains the ZIP code:
+#   /homes/{street-slug}/{city}/NC/{zip}/{mls_id}/
+
+_SC_BASE = "https://www.searchcharlotte.com"
+_SC_RESULTS = f"{_SC_BASE}/results-gallery/?status=A"
+_SC_URL_RE = re.compile(
+    r"/homes/([^/]+)/([^/]+)/([A-Z]{2})/(\d{5})/(\d+)/?"
+)
+
+
+def scrape_searchcharlotte(
+    listing_type: str = "for_sale",
+    max_pages: int = 5,
+    min_price: int | None = None,
+    max_price: int | None = None,
+    progress_cb=None,
+) -> list[dict]:
+    """
+    Scrape SearchCharlotte.com (BHHS Carolinas' IDX) for active listings.
+
+    Server-rendered HTML, no bot protection. Pushes price filter to the
+    URL when given (BoomTown convention: &priceMin=...&priceMax=...).
+    """
+    if listing_type != "for_sale":
+        logger.info("[searchcharlotte] only supports for_sale; skipping for_rent")
+        return []
+
+    now = datetime.now(timezone.utc).isoformat()
+    session = requests.Session()
+    session.headers.update({
+        **_HEADERS,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+
+    price_qs = ""
+    if min_price is not None:
+        price_qs += f"&priceMin={min_price}"
+    if max_price is not None:
+        price_qs += f"&priceMax={max_price}"
+
+    all_listings: list[dict] = []
+    seen_urls:    set[str]   = set()
+
+    for pg in range(1, max_pages + 1):
+        _emit_progress(progress_cb, pg, max_pages, f"page {pg}")
+        url = _SC_RESULTS + price_qs + (f"&pageIndex={pg}" if pg > 1 else "")
+        try:
+            resp = session.get(url, timeout=20)
+        except Exception as exc:
+            logger.error("[searchcharlotte] request failed page %d: %s", pg, exc)
+            break
+        if resp.status_code != 200:
+            logger.warning("[searchcharlotte] status %d on page %d", resp.status_code, pg)
+            break
+
+        rows = _parse_searchcharlotte_cards(resp.text, now, seen_urls)
+        if not rows:
+            logger.info("[searchcharlotte] no cards on page %d — stopping", pg)
+            break
+        all_listings.extend(rows)
+        logger.info("[searchcharlotte] page %d: %d listings", pg, len(rows))
+        time.sleep(random.uniform(1.5, 3.0))
+
+    all_listings = _apply_price_filter(all_listings, min_price, max_price)
+    logger.info("[searchcharlotte] total scraped: %d listings", len(all_listings))
+    return all_listings
+
+
+def _parse_searchcharlotte_cards(
+    html: str,
+    scraped_at: str,
+    seen_urls: set[str],
+) -> list[dict]:
+    soup  = BeautifulSoup(html, "lxml")
+    cards = soup.select(".bt-listing-teaser")
+    out: list[dict] = []
+
+    for c in cards:
+        link = c.find("a", href=lambda h: bool(h and "/homes/" in h))
+        if not link:
+            continue
+        url = link.get("href", "").strip()
+        if not url or url in seen_urls:
+            continue
+
+        m = _SC_URL_RE.search(url)
+        if m:
+            street_slug, city_slug, state, zip_clean, _mls = m.groups()
+            street   = street_slug.replace("-", " ")
+            city_raw = city_slug.replace("-", " ")
+        else:
+            street, city_raw, state, zip_clean = "", "Charlotte", "NC", ""
+
+        # The .bt-cover__wrapper alt has the cleaner address text
+        cover = c.find(class_="bt-cover__wrapper")
+        addr_text = (cover.get("alt") if cover else "") or f"{street}, {city_raw}, {state} {zip_clean}"
+
+        price_el = c.select_one(".listing-card__price")
+        price_raw = ""
+        if price_el:
+            pm = re.search(r"\$([\d,]+)", price_el.get_text())
+            if pm:
+                price_raw = pm.group(1).replace(",", "")
+
+        # Meta text contains "2 beds 2 baths 1,309 sqft"
+        meta_text = c.get_text(" ", strip=True)
+        beds_m = re.search(r"(\d+)\s+beds?", meta_text, re.I)
+        bath_m = re.search(r"(\d+(?:\.\d)?)\s+baths?", meta_text, re.I)
+        sqft_m = re.search(r"([\d,]+)\s+sqft", meta_text, re.I)
+
+        # Property type isn't always exposed on the card; infer from MLS context
+        prop_type = ""
+        if "Condo" in meta_text:
+            prop_type = "condo"
+        elif "Townhouse" in meta_text or "Townhome" in meta_text:
+            prop_type = "townhouse"
+        elif sqft_m:
+            prop_type = "single family residence"
+
+        seen_urls.add(url)
+        out.append({
+            "title":         addr_text,
+            "price":         price_raw,
+            "location":      addr_text,
+            "bedrooms":      _norm_beds(beds_m.group(1)) if beds_m else "",
+            "bathrooms":     _norm_baths(bath_m.group(1)) if bath_m else "",
+            "sqft":          _norm_sqft(sqft_m.group(1)) if sqft_m else "",
+            "url":           url,
+            "date_posted":   "",
+            "date_scraped":  scraped_at,
+            "source":        "searchcharlotte",
+            "city":          _norm_city(city_raw),
+            "zip":           zip_clean,
+            "listing_type":  "for_sale",
+            "property_type": prop_type,
+        })
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -1023,22 +1443,32 @@ def scrape_charlotte_houses(
     source: str = "redfin",
     listing_type: str = "for_sale",
     max_pages: int = 1,
+    min_price: int | None = None,
+    max_price: int | None = None,
+    progress_cb=None,
+    zip_subset: list[int] | None = None,
 ) -> list[dict]:
     """
-    Main entry point for scraping Charlotte, NC house listings.
+    Main entry point for scraping Charlotte, NC housing listings.
 
-    Parameters
-    ----------
-    source       : 'redfin' | 'zillow' | 'realtor'
-    listing_type : 'for_sale' | 'for_rent'
-    max_pages    : pages to fetch
+    zip_subset is forwarded to the Zillow scraper only (rotation system).
+    The Zillow scraper returns (listings, succeeded_zips); this wrapper
+    strips the second element so callers get a plain list[dict].
     """
+    kw = {"min_price": min_price, "max_price": max_price, "progress_cb": progress_cb}
     if source == "zillow":
-        return scrape_zillow_charlotte(listing_type, max_pages)
+        listings, _succeeded = scrape_zillow_charlotte(
+            listing_type, max_pages, **kw, zip_subset=zip_subset
+        )
+        return listings
     if source == "realtor":
-        return scrape_realtor_charlotte(listing_type, max_pages)
+        return scrape_realtor_charlotte(listing_type, max_pages, **kw)
     if source == "craigslist":
-        return scrape_craigslist_charlotte(listing_type, max_pages)
+        return scrape_craigslist_charlotte(listing_type, max_pages, **kw)
     if source == "estately":
-        return scrape_estately_charlotte(listing_type, max_pages)
-    return scrape_redfin_charlotte(listing_type, max_pages)
+        return scrape_estately_charlotte(listing_type, max_pages, **kw)
+    if source == "apartments":
+        return scrape_apartments_charlotte(listing_type, max_pages, **kw)
+    if source == "searchcharlotte":
+        return scrape_searchcharlotte(listing_type, max_pages, **kw)
+    return scrape_redfin_charlotte(listing_type, max_pages, **kw)

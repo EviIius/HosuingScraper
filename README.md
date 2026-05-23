@@ -1,88 +1,107 @@
-# Housing Scraper
+# Charlotte House Finder
 
-A web scraper that collects apartment listings from **Craigslist** and
-presents them in a clean, filterable frontend interface.  Scrapes can be
-triggered manually at any time; new listings are merged into a local SQLite
-database so re-runs only store genuinely new records.
+A Charlotte, NC housing scraper that pulls listings from six sources —
+houses, townhomes, condos, and apartments — into a single filterable
+frontend backed by SQLite.
 
----
-
-## Features
-
-| Feature | Details |
-|---|---|
-| Multi-city scraping | SF Bay Area, New York, LA, Chicago, Seattle, Austin, Denver, Boston |
-| Incremental updates | Re-scraping only adds listings not already in the database (deduped by URL) |
-| Scrape history | Every run is logged with timing, count of new listings, and status |
-| REST API | JSON endpoints for listings, scrape trigger, status, and history |
-| Responsive UI | Card-based grid, city + bedroom filters, pagination |
+Three of the sources (Zillow, Realtor.com, Apartments.com) use anti-bot
+protection. We bypass them with **SeleniumBase UC Mode**, which drives a
+real headless Chrome and defeats Cloudflare/PerimeterX out of the box. No
+paid APIs, no proxies.
 
 ---
 
-## Project Layout
+## Sources
 
-```
-backend/
-  app.py           Flask application (API + static file serving)
-  scraper.py       Craigslist apartment scraper
-  database.py      SQLite CRUD layer
-  requirements.txt Python dependencies
-  tests/
-    test_database.py
-    test_scraper.py
-frontend/
-  index.html       Single-page interface
-  styles.css       Responsive stylesheet
-  app.js           Frontend logic (fetch, render, poll)
-.gitignore
-README.md
-```
+| Source             | Method                                       | Covers                        |
+|--------------------|----------------------------------------------|-------------------------------|
+| **Redfin**         | GIS CSV endpoint (cookie-warmed `requests`)  | Houses / condos / townhomes   |
+| **Estately**       | Plain `requests` + BS4 (no bot protection)   | Houses                        |
+| **Craigslist**     | Plain `requests` + BS4                       | Rentals + FSBO                |
+| **Zillow**         | SeleniumBase UC → `__NEXT_DATA__` JSON       | Everything (sale + rent)      |
+| **Realtor.com**    | SeleniumBase UC → JSON-LD `ItemList`         | Houses / townhomes (sale)     |
+| **Apartments.com** | SeleniumBase UC → `article.placard` DOM      | Apartments / townhomes (rent) |
+
+Three sources are "fast" (plain HTTP, run in a few seconds) and three are
+"browser" (10–30 s each, headless Chrome).
 
 ---
 
 ## Quick Start
 
-### 1. Create and activate a virtual environment
-
 ```bash
+# 1. Create + activate a virtual environment
 python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-```
+.venv\Scripts\activate              # Windows
+# source .venv/bin/activate          # macOS/Linux
 
-### 2. Install dependencies
-
-```bash
+# 2. Install dependencies (downloads chromedriver on first browser-source run)
 pip install -r backend/requirements.txt
-```
 
-### 3. Run the server
-
-```bash
+# 3. Run the server
 cd backend
 python app.py
 ```
 
-The server starts on **http://localhost:5000**.  
-Open that URL in your browser – the frontend is served automatically.
+The server starts on <http://localhost:5000> and serves the frontend on
+the same origin.
 
-### 4. Scrape listings
+### Scraping
 
-Click **Scrape Now** in the top-right corner, choose a city and the number
-of pages (1 page ≈ 120 listings), then click **Start Scrape**.  
-The badge in the header shows live status; the grid refreshes automatically
-when the scrape completes.
+Click **Scrape Now**. You'll see two "all" options plus six individual
+sources:
+
+- **Fast Sources** — Redfin + Estately + Craigslist. Finishes in seconds.
+- **All Sources (incl. browser)** — adds Zillow + Realtor + Apartments.
+  Slower (~1–2 min), but full coverage of houses, townhomes, apartments.
+
+Pick one, choose For Sale or For Rent, set max pages, and start. The
+header badge polls progress and the grid refreshes when the run finishes.
 
 ---
 
 ## API Reference
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/listings` | Paginated listing results. Query params: `city`, `bedrooms`, `limit`, `offset` |
-| `POST` | `/api/scrape` | Start a scrape. Body: `{ "city": "sfbay", "max_pages": 2 }` |
-| `GET` | `/api/status` | Current scrape status (`running`, `message`, `last_run`) |
-| `GET` | `/api/history` | Last 10 scrape-run records |
-| `GET` | `/api/cities` | Supported cities list |
+| Method | Path                  | Description |
+|--------|-----------------------|-------------|
+| `GET`  | `/api/listings`       | Paginated results. Query params: `city`, `bedrooms`, `bathrooms`, `min_price`, `max_price`, `listing_type`, `source`, `limit`, `offset` |
+| `POST` | `/api/scrape`         | Start a scrape. Body: `{ "source": "all"\|"all_full"\|"redfin"\|"zillow"\|..., "listing_type": "for_sale"\|"for_rent", "max_pages": 1-5 }` |
+| `GET`  | `/api/status`         | Current scrape job status |
+| `GET`  | `/api/history`        | Last 10 scrape runs |
+| `GET`  | `/api/cities`         | Charlotte-area filter options |
+| `GET`  | `/api/export.csv`     | Download current filter set as CSV |
+
+---
+
+## Project Layout
+
+```text
+backend/
+  app.py            Flask API + static file serving
+  scraper.py        All six source scrapers + dispatcher
+  database.py       SQLite CRUD layer
+  requirements.txt
+  tests/
+    test_database.py
+frontend/
+  index.html
+  styles.css
+  app.js
+scrape_diagnostic.py  Standalone tool to check anti-bot status of any site
+```
+
+---
+
+## Notes
+
+- For personal, non-commercial use only.
+- SeleniumBase downloads the matching Chromedriver automatically on first
+  run; you don't need to install it manually.
+- If your Windows machine has strict Application Control / Smart App
+  Control, install the venv outside protected directories — Selenium's
+  `.pyd` files need to load freely.
+- Apartments.com only carries rentals; selecting "For Sale" with that
+  source returns an empty list cleanly.
 
 ---
 
@@ -90,15 +109,5 @@ when the scrape completes.
 
 ```bash
 cd backend
-pytest tests/ -v
+pytest tests/test_database.py -v
 ```
-
----
-
-## Notes
-
-- Data is sourced from Craigslist.  For personal, non-commercial use only.
-- Craigslist may rate-limit repeated requests; the scraper pauses 1.5 s
-  between pages to be respectful.
-- The scraper detects whether the page uses the old (pre-2022) or new
-  (post-2022) Craigslist HTML layout and parses either automatically.

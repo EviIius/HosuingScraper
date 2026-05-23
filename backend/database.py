@@ -48,6 +48,7 @@ def init_db(db_path: str = DB_PATH) -> None:
                 date_scraped  TEXT,
                 source        TEXT,
                 city          TEXT,
+                zip           TEXT,
                 listing_type  TEXT    DEFAULT 'for_sale',
                 property_type TEXT,
                 created_at    TEXT    DEFAULT (datetime('now'))
@@ -63,13 +64,43 @@ def init_db(db_path: str = DB_PATH) -> None:
                 status         TEXT,
                 error          TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS zillow_zip_history (
+                zip            TEXT PRIMARY KEY,
+                last_scraped   TEXT
+            );
             """
         )
         # Migrate older databases that are missing the new columns
         _add_column_if_missing(conn, "listings", "bathrooms",     "TEXT")
         _add_column_if_missing(conn, "listings", "listing_type",  "TEXT DEFAULT 'for_sale'")
         _add_column_if_missing(conn, "listings", "property_type", "TEXT")
+        _add_column_if_missing(conn, "listings", "zip",           "TEXT")
+        # Backfill ZIP for any pre-existing rows by parsing it out of location/title
+        _backfill_zips(conn)
     logger.info("Database initialised at %s", db_path)
+
+
+def _backfill_zips(conn) -> None:
+    """Fill in `zip` for rows that have it embedded in location/title text."""
+    import re
+    zip_re = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
+    rows = conn.execute(
+        "SELECT id, title, location FROM listings WHERE zip IS NULL OR zip = ''"
+    ).fetchall()
+    if not rows:
+        return
+    updates: list[tuple[str, int]] = []
+    for r in rows:
+        for src in (r["location"] or "", r["title"] or ""):
+            m = zip_re.search(src)
+            if m:
+                updates.append((m.group(1), r["id"]))
+                break
+    if updates:
+        conn.executemany("UPDATE listings SET zip = ? WHERE id = ?", updates)
+        conn.commit()
+        logger.info("Backfilled ZIP on %d listings", len(updates))
 
 
 def _add_column_if_missing(conn, table: str, column: str, col_def: str) -> None:
@@ -101,9 +132,9 @@ def upsert_listings(listings: list[dict], db_path: str = DB_PATH) -> int:
                     """
                     INSERT OR IGNORE INTO listings
                         (title, price, location, bedrooms, bathrooms, sqft, url,
-                         date_posted, date_scraped, source, city,
+                         date_posted, date_scraped, source, city, zip,
                          listing_type, property_type)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         listing.get("title"),
@@ -117,6 +148,7 @@ def upsert_listings(listings: list[dict], db_path: str = DB_PATH) -> int:
                         listing.get("date_scraped"),
                         listing.get("source"),
                         listing.get("city"),
+                        listing.get("zip"),
                         listing.get("listing_type", "for_sale"),
                         listing.get("property_type"),
                     ),
@@ -127,6 +159,60 @@ def upsert_listings(listings: list[dict], db_path: str = DB_PATH) -> int:
                 logger.error("Error inserting listing: %s", exc)
         conn.commit()
     return new_count
+
+
+_SORT_SQL = {
+    "price_desc": "CAST(REPLACE(COALESCE(price,'0'),',','') AS REAL) DESC",
+    "price_asc":  "CASE WHEN price IS NULL OR TRIM(price)='' THEN 999999999 ELSE CAST(REPLACE(price,',','') AS REAL) END ASC",
+    "sqft_desc":  "CAST(COALESCE(NULLIF(sqft,''),'0') AS REAL) DESC",
+    "sqft_asc":   "CAST(COALESCE(NULLIF(sqft,''),'0') AS REAL) ASC",
+    "newest":     "date_scraped DESC",
+}
+
+
+def _filter_clauses(
+    city, bedrooms, bathrooms, min_price, max_price,
+    listing_type, source, zips,
+    property_type=None, min_sqft=None, max_sqft=None,
+):
+    """Build WHERE clauses + params used by both list and count queries."""
+    query  = ""
+    params: list = []
+    if city:
+        query += " AND city = ?"
+        params.append(city)
+    if bedrooms:
+        query += " AND CAST(COALESCE(NULLIF(bedrooms,''),'0') AS REAL) >= ?"
+        params.append(float(bedrooms))
+    if listing_type:
+        query += " AND listing_type = ?"
+        params.append(listing_type)
+    if source:
+        query += " AND source = ?"
+        params.append(source)
+    if zips:
+        placeholders = ",".join("?" * len(zips))
+        query += f" AND zip IN ({placeholders})"
+        params.extend(zips)
+    if bathrooms:
+        query += " AND CAST(COALESCE(bathrooms,'0') AS REAL) >= ?"
+        params.append(float(bathrooms))
+    if min_price:
+        query += " AND CAST(REPLACE(COALESCE(price,'0'),',','') AS REAL) >= ?"
+        params.append(float(min_price))
+    if max_price:
+        query += " AND CAST(REPLACE(COALESCE(price,'0'),',','') AS REAL) <= ?"
+        params.append(float(max_price))
+    if property_type:
+        query += " AND LOWER(COALESCE(property_type,'')) LIKE ?"
+        params.append(f"%{property_type.lower()}%")
+    if min_sqft:
+        query += " AND CAST(COALESCE(NULLIF(sqft,''),'0') AS REAL) >= ?"
+        params.append(float(min_sqft))
+    if max_sqft:
+        query += " AND CAST(COALESCE(NULLIF(sqft,''),'0') AS REAL) <= ?"
+        params.append(float(max_sqft))
+    return query, params
 
 
 def get_listings(
@@ -140,34 +226,20 @@ def get_listings(
     db_path: str = DB_PATH,
     listing_type: str | None = None,
     source: str | None = None,
+    zips: list[str] | None = None,
+    property_type: str | None = None,
+    min_sqft: str | None = None,
+    max_sqft: str | None = None,
+    sort_by: str | None = None,
 ) -> list[dict]:
     """Return listings with optional filters."""
-    query  = "SELECT * FROM listings WHERE 1=1"
-    params: list = []
-
-    if city:
-        query += " AND city = ?"
-        params.append(city)
-    if bedrooms:
-        query += " AND bedrooms = ?"
-        params.append(bedrooms)
-    if listing_type:
-        query += " AND listing_type = ?"
-        params.append(listing_type)
-    if source:
-        query += " AND source = ?"
-        params.append(source)
-    if bathrooms:
-        query += " AND CAST(COALESCE(bathrooms,'0') AS REAL) >= ?"
-        params.append(float(bathrooms))
-    if min_price:
-        query += " AND CAST(REPLACE(COALESCE(price,'0'),',','') AS REAL) >= ?"
-        params.append(float(min_price))
-    if max_price:
-        query += " AND CAST(REPLACE(COALESCE(price,'0'),',','') AS REAL) <= ?"
-        params.append(float(max_price))
-
-    query += " ORDER BY date_scraped DESC LIMIT ? OFFSET ?"
+    where, params = _filter_clauses(
+        city, bedrooms, bathrooms, min_price, max_price,
+        listing_type, source, zips,
+        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft,
+    )
+    order = _SORT_SQL.get(sort_by or "", "date_scraped DESC")
+    query = f"SELECT * FROM listings WHERE 1=1{where} ORDER BY {order} LIMIT ? OFFSET ?"
     params.extend([limit, offset])
 
     with get_connection(db_path) as conn:
@@ -184,36 +256,32 @@ def get_listing_count(
     db_path: str = DB_PATH,
     listing_type: str | None = None,
     source: str | None = None,
+    zips: list[str] | None = None,
+    property_type: str | None = None,
+    min_sqft: str | None = None,
+    max_sqft: str | None = None,
 ) -> int:
     """Return total number of listings (optionally filtered)."""
-    query  = "SELECT COUNT(*) AS count FROM listings WHERE 1=1"
-    params: list = []
-
-    if city:
-        query += " AND city = ?"
-        params.append(city)
-    if bedrooms:
-        query += " AND bedrooms = ?"
-        params.append(bedrooms)
-    if listing_type:
-        query += " AND listing_type = ?"
-        params.append(listing_type)
-    if source:
-        query += " AND source = ?"
-        params.append(source)
-    if bathrooms:
-        query += " AND CAST(COALESCE(bathrooms,'0') AS REAL) >= ?"
-        params.append(float(bathrooms))
-    if min_price:
-        query += " AND CAST(REPLACE(COALESCE(price,'0'),',','') AS REAL) >= ?"
-        params.append(float(min_price))
-    if max_price:
-        query += " AND CAST(REPLACE(COALESCE(price,'0'),',','') AS REAL) <= ?"
-        params.append(float(max_price))
-
+    where, params = _filter_clauses(
+        city, bedrooms, bathrooms, min_price, max_price,
+        listing_type, source, zips,
+        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft,
+    )
+    query = "SELECT COUNT(*) AS count FROM listings WHERE 1=1" + where
     with get_connection(db_path) as conn:
         row = conn.execute(query, params).fetchone()
         return row["count"]
+
+
+def get_property_types(db_path: str = DB_PATH) -> list[str]:
+    """Return distinct non-empty property_type values from the listings table."""
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT property_type FROM listings "
+            "WHERE property_type IS NOT NULL AND TRIM(property_type) != '' "
+            "ORDER BY property_type"
+        ).fetchall()
+        return [row[0] for row in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -249,3 +317,62 @@ def get_scrape_history(limit: int = 10, db_path: str = DB_PATH) -> list[dict]:
             "SELECT * FROM scrape_log ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Zillow ZIP rotation
+# ---------------------------------------------------------------------------
+
+def get_zillow_zip_queue(max_zips: int = 4, db_path: str = DB_PATH) -> list[int]:
+    """
+    Return up to max_zips ZIP codes prioritised for the next Zillow scrape.
+
+    ZIPs that have never been scraped come first (NULL last_scraped), then
+    the ones whose last_scraped timestamp is oldest. This ensures every ZIP
+    cycles through in roughly equal time regardless of how often scrapes run.
+    """
+    from scraper import CHARLOTTE_ZIP_REGIONS
+    all_zips = [str(z) for z in CHARLOTTE_ZIP_REGIONS.keys()]
+
+    with get_connection(db_path) as conn:
+        scraped = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT zip, last_scraped FROM zillow_zip_history"
+            ).fetchall()
+        }
+
+    # Never-scraped ZIPs sort before any ISO timestamp (empty string < any date)
+    sorted_zips = sorted(all_zips, key=lambda z: scraped.get(z) or "")
+    return [int(z) for z in sorted_zips[:max_zips]]
+
+
+def mark_zillow_zips_scraped(zips: list[int], db_path: str = DB_PATH) -> None:
+    """Record that these ZIPs were attempted in the current scrape run."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection(db_path) as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO zillow_zip_history (zip, last_scraped) VALUES (?, ?)",
+            [(str(z), now) for z in zips],
+        )
+        conn.commit()
+
+
+def get_zillow_zip_coverage(db_path: str = DB_PATH) -> list[dict]:
+    """Return last-scraped timestamps for all Zillow ZIPs (for the status API)."""
+    from scraper import CHARLOTTE_ZIP_REGIONS
+    all_zips = [str(z) for z in CHARLOTTE_ZIP_REGIONS.keys()]
+
+    with get_connection(db_path) as conn:
+        scraped = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT zip, last_scraped FROM zillow_zip_history"
+            ).fetchall()
+        }
+
+    return [
+        {"zip": z, "last_scraped": scraped.get(z)}
+        for z in all_zips
+    ]
