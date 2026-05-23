@@ -32,8 +32,12 @@
 
       <label class="form-label" for="scrape-source">Source</label>
       <select id="scrape-source" class="form-select">
+        <option value="all">All Sources (Redfin + Estately + Craigslist)</option>
         <option value="redfin">Redfin</option>
+        <option value="zillow">Zillow (Browser)</option>
         <option value="realtor">Realtor.com</option>
+        <option value="craigslist">Craigslist</option>
+        <option value="estately">Estately</option>
       </select>
 
       <label class="form-label" for="scrape-type">Listing Type</label>
@@ -103,6 +107,17 @@
           <option value="4">4+</option>
         </select>
       </div>
+      <div class="filter-group">
+        <label class="form-label" for="filter-source">Source</label>
+        <select id="filter-source" class="form-select filter-select">
+          <option value="">All Sources</option>
+          <option value="redfin">Redfin</option>
+          <option value="zillow">Zillow</option>
+          <option value="craigslist">Craigslist</option>
+          <option value="estately">Estately</option>
+          <option value="realtor">Realtor.com</option>
+        </select>
+      </div>
       <div class="filter-group filter-group--price">
         <label class="form-label">Price Range</label>
         <div class="price-range-row">
@@ -112,6 +127,7 @@
         </div>
       </div>
       <button id="btn-clear" class="btn btn-secondary btn-sm">Clear</button>
+      <button id="btn-export" class="btn btn-secondary btn-sm" title="Download filtered listings as CSV">Export CSV</button>
       <span id="result-count" class="result-count"></span>
     </div>
   </div>
@@ -148,7 +164,7 @@
 
   <!-- ===== FOOTER ===== -->
   <footer class="site-footer">
-    <p>Data sourced from Redfin &amp; Zillow. For personal, non-commercial use only.</p>
+    <p>Data sourced from Redfin, Zillow &amp; Realtor.com. For personal, non-commercial use only.</p>
   </footer>
 
   <script src="app.js"></script>

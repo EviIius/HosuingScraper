@@ -14,6 +14,7 @@ let state = {
   filterBathrooms: "",
   filterMinPrice:  "",
   filterMaxPrice:  "",
+  filterSource:    "",
   scraping:        false,
   pollTimer:       null,
 };
@@ -100,6 +101,7 @@ async function loadListings() {
   if (state.filterBathrooms) params.set("bathrooms",    state.filterBathrooms);
   if (state.filterMinPrice)  params.set("min_price",    state.filterMinPrice);
   if (state.filterMaxPrice)  params.set("max_price",    state.filterMaxPrice);
+  if (state.filterSource)    params.set("source",       state.filterSource);
 
   try {
     const data = await apiFetch(`/api/listings?${params}`);
@@ -155,7 +157,7 @@ function buildCard(l) {
     : `<span class="type-badge type-sale">For Sale</span>`;
 
   // Source pill (overlaid on image)
-  const srcLabel = { redfin: "Redfin", realtor: "Realtor.com" }[l.source] || l.source;
+  const srcLabel = { redfin: "Redfin", zillow: "Zillow", realtor: "Realtor.com", craigslist: "Craigslist", estately: "Estately" }[l.source] || l.source;
   const srcBadge = l.source
     ? `<span class="source-tag source-${esc(l.source)}">${esc(srcLabel)}</span>`
     : "";
@@ -331,6 +333,11 @@ function wireEvents() {
     state.offset = 0;
     loadListings();
   });
+  $("filter-source").addEventListener("change", e => {
+    state.filterSource = e.target.value;
+    state.offset = 0;
+    loadListings();
+  });
 
   const reloadDebounced = debounce(() => { state.offset = 0; loadListings(); }, 400);
   $("filter-min-price").addEventListener("input", e => {
@@ -342,6 +349,18 @@ function wireEvents() {
     reloadDebounced();
   });
 
+  $("btn-export").addEventListener("click", () => {
+    const params = new URLSearchParams();
+    if (state.filterCity)      params.set("city",         state.filterCity);
+    if (state.filterType)      params.set("listing_type", state.filterType);
+    if (state.filterBedrooms)  params.set("bedrooms",     state.filterBedrooms);
+    if (state.filterBathrooms) params.set("bathrooms",    state.filterBathrooms);
+    if (state.filterMinPrice)  params.set("min_price",    state.filterMinPrice);
+    if (state.filterMaxPrice)  params.set("max_price",    state.filterMaxPrice);
+    if (state.filterSource)    params.set("source",       state.filterSource);
+    window.location.href = `/api/export.csv?${params}`;
+  });
+
   $("btn-clear").addEventListener("click", () => {
     $("filter-city").value      = "";
     $("filter-type").value      = "";
@@ -349,12 +368,14 @@ function wireEvents() {
     $("filter-bathrooms").value = "";
     $("filter-min-price").value = "";
     $("filter-max-price").value = "";
+    $("filter-source").value    = "";
     state.filterCity      = "";
     state.filterType      = "";
     state.filterBedrooms  = "";
     state.filterBathrooms = "";
     state.filterMinPrice  = "";
     state.filterMaxPrice  = "";
+    state.filterSource    = "";
     state.offset = 0;
     loadListings();
   });

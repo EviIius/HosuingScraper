@@ -431,8 +431,11 @@ a:hover { text-decoration: underline; }
   color: #475569;
   backdrop-filter: blur(4px);
 }
-.source-redfin  { background: rgba(254,226,226,.9); color: #b91c1c; }
-.source-realtor { background: rgba(254,240,138,.9); color: #854d0e; }
+.source-redfin      { background: rgba(254,226,226,.9); color: #b91c1c; }
+.source-zillow      { background: rgba(209,250,229,.9); color: #065f46; }
+.source-realtor     { background: rgba(254,240,138,.9); color: #854d0e; }
+.source-craigslist  { background: rgba(224,231,255,.9); color: #3730a3; }
+.source-estately    { background: rgba(237,233,254,.9); color: #5b21b6; }
 .prop-tag {
   display: inline-block;
   font-size: .72rem;

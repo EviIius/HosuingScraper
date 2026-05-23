@@ -139,6 +139,7 @@ def get_listings(
     offset: int = 0,
     db_path: str = DB_PATH,
     listing_type: str | None = None,
+    source: str | None = None,
 ) -> list[dict]:
     """Return listings with optional filters."""
     query  = "SELECT * FROM listings WHERE 1=1"
@@ -153,6 +154,9 @@ def get_listings(
     if listing_type:
         query += " AND listing_type = ?"
         params.append(listing_type)
+    if source:
+        query += " AND source = ?"
+        params.append(source)
     if bathrooms:
         query += " AND CAST(COALESCE(bathrooms,'0') AS REAL) >= ?"
         params.append(float(bathrooms))
@@ -173,11 +177,13 @@ def get_listings(
 
 def get_listing_count(
     city: str | None = None,
+    bedrooms: str | None = None,
     bathrooms: str | None = None,
     min_price: str | None = None,
     max_price: str | None = None,
     db_path: str = DB_PATH,
     listing_type: str | None = None,
+    source: str | None = None,
 ) -> int:
     """Return total number of listings (optionally filtered)."""
     query  = "SELECT COUNT(*) AS count FROM listings WHERE 1=1"
@@ -186,9 +192,15 @@ def get_listing_count(
     if city:
         query += " AND city = ?"
         params.append(city)
+    if bedrooms:
+        query += " AND bedrooms = ?"
+        params.append(bedrooms)
     if listing_type:
         query += " AND listing_type = ?"
         params.append(listing_type)
+    if source:
+        query += " AND source = ?"
+        params.append(source)
     if bathrooms:
         query += " AND CAST(COALESCE(bathrooms,'0') AS REAL) >= ?"
         params.append(float(bathrooms))
