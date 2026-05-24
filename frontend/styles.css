@@ -478,6 +478,7 @@ a:hover { text-decoration: underline; }
 .source-estately        { background: rgba(237,233,254,.9); color: #5b21b6; }
 .source-apartments      { background: rgba(255,228,230,.9); color: #9f1239; }
 .source-searchcharlotte { background: rgba(220,252,231,.9); color: #166534; }
+.source-homes           { background: rgba(254,243,199,.9); color: #92400e; }
 
 .prop-tag {
   display: inline-flex;

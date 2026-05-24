@@ -73,6 +73,7 @@ SCRAPE_SOURCES: dict[str, str] = {
     "estately":       "Estately",
     "apartments":     "Apartments.com",
     "searchcharlotte": "SearchCharlotte (BHHS)",
+    "homes":          "Homes.com",
 }
 
 # Curated Charlotte-area neighborhoods -> ZIP groups. Used by the
@@ -512,13 +513,126 @@ def _parse_realtor_html(
     """
     Parse Realtor.com search results.
 
-    Tries JSON-LD first (clean structured data); falls back to DOM card
-    parsing when JSON-LD is absent or returns nothing.
+    Priority: __NEXT_DATA__ (richest — includes baths + proper prop_type)
+    → JSON-LD → DOM card fallback.
     """
+    rows = _parse_realtor_next_data(html, listing_type, scraped_at, seen_urls)
+    if rows:
+        return rows
     rows = _parse_realtor_jsonld(html, listing_type, scraped_at, seen_urls)
     if rows:
         return rows
     return _parse_realtor_dom(html, listing_type, scraped_at, seen_urls)
+
+
+def _parse_realtor_next_data(
+    html: str,
+    listing_type: str,
+    scraped_at: str,
+    seen_urls: set[str],
+) -> list[dict]:
+    """
+    Parse Realtor.com __NEXT_DATA__ JSON blob (Next.js SSR).
+
+    This is the richest data source: includes proper `prop_type` ("condo",
+    "single_family", etc.) and full bath counts that JSON-LD omits.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    nd   = soup.find("script", id="__NEXT_DATA__")
+    if not nd or not nd.string:
+        return []
+    try:
+        data = json.loads(nd.string)
+    except Exception:
+        return []
+
+    pp = data.get("props", {}).get("pageProps", {})
+
+    # Try several known paths for the property list
+    candidates: list = []
+    for path in (
+        ["searchResults", "properties"],
+        ["properties"],
+        ["initialProps", "searchResults", "properties"],
+        ["searchResults", "results"],
+    ):
+        node = pp
+        for key in path:
+            node = node.get(key, {}) if isinstance(node, dict) else {}
+        if isinstance(node, list) and node:
+            candidates = node
+            break
+
+    if not candidates:
+        return []
+
+    _PROP_TYPE_MAP = {
+        "single_family":       "single family residence",
+        "condos":              "condo",
+        "condo":               "condo",
+        "condominium":         "condo",
+        "townhomes":           "townhouse",
+        "townhouse":           "townhouse",
+        "townhome":            "townhouse",
+        "multi_family":        "multi family",
+        "land":                "land",
+        "mobile":              "mobile home",
+        "manufactured":        "mobile home",
+        "apartment":           "apartment",
+    }
+
+    out: list[dict] = []
+    for item in candidates:
+        addr   = item.get("address") or {}
+        street = (addr.get("line") or "").strip()
+        city_raw  = (addr.get("city") or "Charlotte").strip()
+        state     = (addr.get("state_code") or "NC").strip()
+        zip_clean = _extract_zip(addr.get("postal_code") or "", street)
+
+        price = str(item.get("list_price") or item.get("price") or "")
+        beds  = str(item.get("beds")       or item.get("beds_min")  or "")
+        baths = str(
+            item.get("baths_consolidated") or
+            item.get("baths_full")         or
+            item.get("baths")              or
+            item.get("baths_min")          or ""
+        )
+        sqft  = str(item.get("sqft_min") or item.get("sqft") or "")
+
+        prop_raw  = (item.get("prop_type") or item.get("property_type") or "").lower()
+        prop_type = _PROP_TYPE_MAP.get(prop_raw, prop_raw.replace("_", " "))
+
+        permalink = item.get("permalink") or ""
+        prop_id   = item.get("property_id") or ""
+        if permalink:
+            url = (permalink if permalink.startswith("http")
+                   else f"https://www.realtor.com/realestateandhomes-detail/{permalink}")
+        elif prop_id:
+            url = f"https://www.realtor.com/realestateandhomes-detail/{prop_id}"
+        else:
+            url = ""
+
+        if not url or not street or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        out.append({
+            "title":         f"{street}{_DASH}{city_raw}, {state} {zip_clean}".rstrip(),
+            "price":         price.replace(",", ""),
+            "location":      f"{street}, {city_raw}, {state} {zip_clean}".rstrip(),
+            "bedrooms":      _norm_beds(beds),
+            "bathrooms":     _norm_baths(baths),
+            "sqft":          _norm_sqft(sqft),
+            "url":           url,
+            "date_posted":   "",
+            "date_scraped":  scraped_at,
+            "source":        "realtor",
+            "city":          _norm_city(city_raw),
+            "zip":           zip_clean,
+            "listing_type":  listing_type,
+            "property_type": prop_type,
+        })
+
+    return out
 
 
 def _parse_realtor_jsonld(
@@ -559,6 +673,14 @@ def _parse_realtor_jsonld(
         if isinstance(prop_type_raw, list):
             prop_type_raw = prop_type_raw[0] if prop_type_raw else ""
         prop_type = _camel_to_words(prop_type_raw).lower()
+        # schema.org uses "Apartment" for both apartments and condos;
+        # look for "condo" in adjacent text to correct the type.
+        if prop_type in ("apartment", ""):
+            hint = (name + " " + str(offer.get("description") or "")).lower()
+            if "condo" in hint:
+                prop_type = "condo"
+            elif "townhome" in hint or "townhouse" in hint:
+                prop_type = "townhouse"
 
         street   = (addr.get("streetAddress") or "").strip()
         city_raw = (addr.get("addressLocality") or "Charlotte").strip()
@@ -572,7 +694,11 @@ def _parse_realtor_jsonld(
             "price":         str(offer.get("price") or ""),
             "location":      f"{full_addr}, {city_raw}, {state} {zip_clean}".rstrip(),
             "bedrooms":      _norm_beds(str(ent.get("numberOfBedrooms") or "")),
-            "bathrooms":     _norm_baths(str(ent.get("numberOfBathroomsTotal") or "")),
+            "bathrooms":     _norm_baths(str(
+                ent.get("numberOfBathroomsTotal") or
+                ent.get("numberOfFullBathrooms")  or
+                ent.get("numberOfBathrooms")      or ""
+            )),
             "sqft":          _norm_sqft(str(floor.get("value") or "")),
             "url":           url,
             "date_posted":   "",
@@ -989,6 +1115,194 @@ def _parse_apartments_placards(
             "zip":           zip_clean,
             "listing_type":  "for_rent",
             "property_type": "apartment",
+        })
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Homes.com scraper (SeleniumBase UC + __NEXT_DATA__ / DOM)
+# ---------------------------------------------------------------------------
+#
+# Homes.com is owned by CoStar and has Cloudflare protection, so we use
+# SeleniumBase UC (same as Zillow/Realtor).  We target the condo/townhome
+# search URL per-ZIP and use fresh browser sessions to avoid bot blocks.
+#
+# Default ZIP set focuses on South End and adjacent Charlotte neighborhoods:
+#   28203 – South End / LoSo / Dilworth (core)
+#   28202 – Uptown / 4th Ward (luxury condos)
+#   28209 – South Dilworth / Myers Park corridor
+#   28208 – Wilmore / Seversville (adjacent west)
+#   28204 – Elizabeth / Midtown (adjacent east)
+#   28207 – Myers Park / Eastover
+#   28206 – Optimist Park / NoDa south
+#   28205 – Plaza Midwood / NoDa
+
+_HOMES_BASE = "https://www.homes.com"
+
+# City-level search URLs — Homes.com does not support per-ZIP search pages.
+# Condos + townhomes are scraped separately then merged.
+_HOMES_SEARCH_PATHS = ["condos", "townhomes"]
+
+
+def scrape_homes_charlotte(
+    listing_type: str = "for_sale",
+    max_pages: int = 2,
+    min_price: int | None = None,
+    max_price: int | None = None,
+    progress_cb=None,
+    zip_subset: list[int] | None = None,  # unused — kept for API compat
+) -> list[dict]:
+    """
+    Scrape Homes.com (CoStar) for Charlotte metro condo/townhome listings.
+
+    Only scrapes for-sale — Apartments.com already covers rentals.
+    Uses city-level URLs (homes.com/charlotte-nc/condos/ and /townhomes/)
+    since Homes.com doesn't support per-ZIP search pages.
+    """
+    if listing_type != "for_sale":
+        logger.info("[homes] only supports for_sale; skipping for_rent")
+        return []
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    price_qs = ""
+    if min_price is not None or max_price is not None:
+        parts = []
+        if min_price is not None:
+            parts.append(f"minprice={min_price}")
+        if max_price is not None:
+            parts.append(f"maxprice={max_price}")
+        price_qs = "?" + "&".join(parts)
+
+    all_listings: list[dict] = []
+    seen_urls:    set[str]   = set()
+
+    total_steps = len(_HOMES_SEARCH_PATHS) * max_pages
+    step = 0
+
+    for prop_path in _HOMES_SEARCH_PATHS:
+        prop_type_hint = "condo" if prop_path == "condos" else "townhouse"
+        try:
+            with _open_uc_session() as sb:
+                for page in range(1, max_pages + 1):
+                    step += 1
+                    _emit_progress(progress_cb, step, total_steps,
+                                   f"{prop_path} p{page}")
+                    page_seg = "" if page == 1 else f"p{page}/"
+                    url = (
+                        f"{_HOMES_BASE}/charlotte-nc/{prop_path}/"
+                        f"{page_seg}{price_qs}"
+                    )
+                    try:
+                        sb.uc_open_with_reconnect(url, reconnect_time=_SB_RECONNECT)
+                        sb.sleep(4)
+                    except Exception as exc:
+                        logger.warning("[homes] %s p%d nav failed: %s",
+                                       prop_path, page, exc)
+                        break
+
+                    html = sb.get_page_source()
+                    if "Access denied" in html or "challenge" in html[:1000].lower():
+                        logger.warning("[homes] %s p%d bot-blocked", prop_path, page)
+                        break
+
+                    rows = _parse_homes_dom(html, listing_type, now, seen_urls,
+                                            prop_type_hint)
+                    if not rows:
+                        logger.info("[homes] %s p%d: no listings — stopping",
+                                    prop_path, page)
+                        break
+                    all_listings.extend(rows)
+                    logger.info("[homes] %s p%d: %d listings (total %d)",
+                                prop_path, page, len(rows), len(all_listings))
+                    time.sleep(random.uniform(2.0, 3.5))
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            logger.error("[homes] %s session error: %s", prop_path, exc)
+
+    all_listings = _apply_price_filter(all_listings, min_price, max_price)
+    logger.info("[homes] total scraped: %d listings", len(all_listings))
+    return all_listings
+
+
+def _parse_homes_dom(
+    html: str,
+    listing_type: str,
+    scraped_at: str,
+    seen_urls: set[str],
+    prop_type_hint: str = "condo",
+) -> list[dict]:
+    """Parse Homes.com search result page using article.search-placard cards."""
+    soup  = BeautifulSoup(html, "lxml")
+    cards = soup.select("article.search-placard")
+
+    out: list[dict] = []
+    for card in cards:
+        # URL + address from first image anchor aria-label
+        a = card.find("a", href=True)
+        if not a:
+            continue
+        href = a["href"].strip()
+        if not href.startswith("http"):
+            href = _HOMES_BASE + href
+        if href in seen_urls:
+            continue
+
+        # Address from aria-label: "3109 Marlborough Rd, Charlotte, NC 28208"
+        addr_raw = a.get("aria-label", "") or a.get("title", "")
+        m_addr = re.match(
+            r"^(.+?),\s*([^,]+),\s*NC\s+(\d{5})", addr_raw
+        )
+        if m_addr:
+            street    = m_addr.group(1).strip()
+            city_raw  = m_addr.group(2).strip()
+            zip_clean = m_addr.group(3)
+        else:
+            # Fallback: parse card text
+            txt_full = card.get_text(" ", strip=True)
+            m2 = re.search(r"(\d{5})", txt_full)
+            zip_clean = m2.group(1) if m2 else ""
+            street, city_raw = addr_raw.split(",")[0].strip(), "Charlotte"
+
+        # Price
+        price_el  = card.select_one(".price-container")
+        price_raw = ""
+        if price_el:
+            pm = re.search(r"\$([\d,]+)", price_el.get_text())
+            price_raw = pm.group(1).replace(",", "") if pm else ""
+
+        # Beds / baths / sqft from .detailed-info-container
+        info_el  = card.select_one(".detailed-info-container")
+        info_txt = info_el.get_text(" ", strip=True) if info_el else card.get_text(" ", strip=True)
+        beds_m = re.search(r"(\d+)\s*Bed", info_txt, re.I)
+        bath_m = re.search(r"([\d.]+)\s*Bath", info_txt, re.I)
+        sqft_m = re.search(r"([\d,]+)\s*Sq\s*Ft", info_txt, re.I)
+
+        # Property type: inherit hint (condos page → condo, townhomes page → townhouse)
+        # Override if text explicitly mentions townhome/townhouse
+        full_txt  = card.get_text(" ", strip=True)
+        prop_type = "townhouse" if re.search(r"townhome|townhouse", full_txt, re.I) else prop_type_hint
+
+        if not street:
+            continue
+        seen_urls.add(href)
+        out.append({
+            "title":         f"{street}{_DASH}{city_raw}, NC {zip_clean}".rstrip(),
+            "price":         price_raw,
+            "location":      f"{street}, {city_raw}, NC {zip_clean}".rstrip(),
+            "bedrooms":      _norm_beds(beds_m.group(1) if beds_m else ""),
+            "bathrooms":     _norm_baths(bath_m.group(1) if bath_m else ""),
+            "sqft":          _norm_sqft(sqft_m.group(1).replace(",", "") if sqft_m else ""),
+            "url":           href,
+            "date_posted":   "",
+            "date_scraped":  scraped_at,
+            "source":        "homes",
+            "city":          _norm_city(city_raw),
+            "zip":           zip_clean,
+            "listing_type":  listing_type,
+            "property_type": prop_type,
         })
 
     return out
@@ -1471,4 +1785,6 @@ def scrape_charlotte_houses(
         return scrape_apartments_charlotte(listing_type, max_pages, **kw)
     if source == "searchcharlotte":
         return scrape_searchcharlotte(listing_type, max_pages, **kw)
+    if source == "homes":
+        return scrape_homes_charlotte(listing_type, max_pages, **kw)
     return scrape_redfin_charlotte(listing_type, max_pages, **kw)

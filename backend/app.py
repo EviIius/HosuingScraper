@@ -43,7 +43,7 @@ from scraper import (
 # Fast sources — plain HTTP, no browser needed. Run by default ("all").
 _FAST_SOURCES    = ["redfin", "estately", "craigslist", "searchcharlotte"]
 # Browser sources — SeleniumBase UC, slower but covers anti-bot sites.
-_BROWSER_SOURCES = ["zillow", "realtor", "apartments"]
+_BROWSER_SOURCES = ["zillow", "realtor", "apartments", "homes"]
 # Everything — used when source == "all_full"
 _ALL_SOURCES     = _FAST_SOURCES + _BROWSER_SOURCES
 
@@ -164,6 +164,11 @@ def _run_scrape(
             return _cb
 
         try:
+            # Fast plain-HTTP sources can handle many more pages without
+            # slowing the scrape — give them a higher floor.
+            _SRC_MIN_PAGES = {"searchcharlotte": 25, "estately": 12, "redfin": 10}
+            src_max_pages = max(max_pages, _SRC_MIN_PAGES.get(src, 0))
+
             # Zillow uses ZIP rotation: pick the oldest-scraped ZIPs this run
             # so full coverage builds up across multiple runs without triggering
             # Zillow's IP-level rate limiter on a single session.
@@ -174,14 +179,14 @@ def _run_scrape(
 
             listings, succeeded_zips = (
                 scrape_zillow_charlotte(
-                    listing_type, max_pages,
+                    listing_type, src_max_pages,
                     min_price=min_price, max_price=max_price,
                     progress_cb=_make_cb(), zip_subset=zip_subset,
                 )
                 if src == "zillow"
                 else (
                     scrape_charlotte_houses(
-                        src, listing_type, max_pages,
+                        src, listing_type, src_max_pages,
                         min_price=min_price, max_price=max_price,
                         progress_cb=_make_cb(),
                     ),

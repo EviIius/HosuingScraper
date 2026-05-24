@@ -241,6 +241,7 @@ function buildCard(l) {
     redfin: "Redfin", zillow: "Zillow", realtor: "Realtor.com",
     craigslist: "Craigslist", estately: "Estately",
     apartments: "Apartments.com", searchcharlotte: "SearchCharlotte",
+    homes: "Homes.com",
   };
   const srcLabel = srcLabels[l.source] || l.source;
   const srcBadge = l.source
