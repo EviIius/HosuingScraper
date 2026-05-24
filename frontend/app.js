@@ -15,18 +15,13 @@ const AREA_GROUPS = [
 
 // Property type icons
 const PROP_ICONS = {
-  "condo":           "🏢",
-  "condominium":     "🏢",
-  "townhouse":       "🏘",
-  "townhome":        "🏘",
-  "single family":   "🏡",
-  "single-family":   "🏡",
-  "multi family":    "🏗",
-  "multi-family":    "🏗",
-  "apartment":       "🏬",
-  "land":            "🌳",
-  "mobile":          "🚐",
-  "manufactured":    "🚐",
+  "condo": "🏢", "condominium": "🏢",
+  "townhouse": "🏘", "townhome": "🏘",
+  "single family": "🏡", "single-family": "🏡",
+  "multi family": "🏗", "multi-family": "🏗",
+  "apartment": "🏬",
+  "land": "🌳",
+  "mobile": "🚐", "manufactured": "🚐",
 };
 
 function propIcon(type) {
@@ -38,6 +33,48 @@ function propIcon(type) {
   return "🏠";
 }
 
+// ── Charlotte-metro ZIP centroids ──────────────────────────────
+const ZIP_CENTROIDS = {
+  "28202": [35.2271, -80.8431], "28203": [35.2154, -80.8597],
+  "28204": [35.2195, -80.8283], "28205": [35.2258, -80.8077],
+  "28206": [35.2447, -80.8308], "28207": [35.2028, -80.8254],
+  "28208": [35.2249, -80.8840], "28209": [35.1903, -80.8600],
+  "28210": [35.1680, -80.8611], "28211": [35.1847, -80.8210],
+  "28212": [35.1835, -80.7900], "28213": [35.2642, -80.7952],
+  "28214": [35.2576, -80.9247], "28215": [35.2369, -80.7574],
+  "28216": [35.2804, -80.8821], "28217": [35.1739, -80.8880],
+  "28226": [35.1436, -80.8589], "28227": [35.1756, -80.7574],
+  "28262": [35.3047, -80.7590], "28269": [35.3336, -80.8263],
+  "28277": [35.0882, -80.8421], "28278": [35.1227, -80.9386],
+  "28031": [35.4897, -80.8619], "28036": [35.4907, -80.7930],
+  "28078": [35.4072, -80.8552], "28105": [35.1131, -80.7220],
+  "28104": [35.1092, -80.6597], "28110": [35.1260, -80.6500],
+  "29708": [35.0980, -81.0024], "29730": [34.9249, -81.0251],
+  "28025": [35.4043, -80.5791], "28027": [35.3957, -80.6288],
+  "28075": [35.3220, -80.6470],
+};
+
+function getListingCoords(listing) {
+  const zip  = String(listing.zip || "").trim();
+  const base = ZIP_CENTROIDS[zip] || [35.2271, -80.8431];
+  const jitter = ZIP_CENTROIDS[zip] ? 0.004 : 0.06;
+  return [
+    base[0] + (Math.random() - 0.5) * jitter * 2,
+    base[1] + (Math.random() - 0.5) * jitter * 2,
+  ];
+}
+
+function priceMarkerColor(priceStr) {
+  const n = parseFloat(String(priceStr || "").replace(/,/g, ""));
+  if (isNaN(n) || n === 0) return "#8b949e";
+  if (n < 300000) return "#22d3ee";
+  if (n < 400000) return "#4ade80";
+  if (n < 500000) return "#86efac";
+  if (n < 600000) return "#fbbf24";
+  if (n < 700000) return "#f97316";
+  return "#f87171";
+}
+
 // ── State ─────────────────────────────────────────────────────
 let state = {
   listings:            [],
@@ -45,6 +82,7 @@ let state = {
   offset:              0,
   filterCity:          "",
   filterNeighborhood:  "",
+  filterSearch:        "",
   filterType:          "",
   filterBedrooms:      "",
   filterBathrooms:     "",
@@ -57,12 +95,15 @@ let state = {
   sortBy:              "",
   scraping:            false,
   pollTimer:           null,
+  viewMode:            "grid",  // "grid" | "map"
 };
 
 // ── DOM refs ──────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 
 const grid          = $("listings-grid");
+const mapContainer  = $("map-container");
+const mapLegend     = $("map-legend");
 const stateLoading  = $("state-loading");
 const stateEmpty    = $("state-empty");
 const stateError    = $("state-error");
@@ -103,6 +144,20 @@ function debounce(fn, ms) {
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
 }
 
+// ── Theme ─────────────────────────────────────────────────────
+function applyTheme(theme) {
+  document.body.dataset.theme = theme === "light" ? "light" : "";
+  $("btn-theme").textContent  = theme === "light" ? "🌙" : "☀️";
+  _updateMapTiles();
+}
+
+function toggleTheme() {
+  const isLight = document.body.dataset.theme === "light";
+  const next    = isLight ? "dark" : "light";
+  localStorage.setItem("theme", next);
+  applyTheme(next);
+}
+
 // ── API helpers ───────────────────────────────────────────────
 async function apiFetch(path, opts = {}) {
   const res = await fetch(API + path, opts);
@@ -117,27 +172,18 @@ async function apiFetch(path, opts = {}) {
 async function loadCities() {
   const areas = await apiFetch("/api/cities");
   const sel   = $("filter-city");
-
-  // Build a map from value → label for easy lookup
   const byValue = {};
   areas.forEach(a => { byValue[a.value] = a.label; });
-
   const grouped   = new Set();
   const allValues = areas.map(a => a.value);
-
   AREA_GROUPS.forEach(grp => {
     const matching = grp.values.filter(v => allValues.includes(v));
     if (!matching.length) return;
     const og = document.createElement("optgroup");
     og.label = grp.label;
-    matching.forEach(v => {
-      og.append(new Option(byValue[v] || v, v));
-      grouped.add(v);
-    });
+    matching.forEach(v => { og.append(new Option(byValue[v] || v, v)); grouped.add(v); });
     sel.appendChild(og);
   });
-
-  // Any city not in a group → flat "Other" optgroup
   const ungrouped = allValues.filter(v => !grouped.has(v));
   if (ungrouped.length) {
     const og = document.createElement("optgroup");
@@ -160,19 +206,16 @@ async function loadPropertyTypes() {
   try {
     const types = await apiFetch("/api/property-types");
     const sel = $("filter-property-type");
+    // Remove dynamic options (keep "All Types")
+    while (sel.options.length > 1) sel.remove(1);
     types.forEach(t => sel.append(new Option(t, t)));
   } catch { /* ignore */ }
 }
 
-// ── Listings ──────────────────────────────────────────────────
-async function loadListings() {
-  hide(grid);
-  hide(stateEmpty);
-  hide(stateError);
-  hide(pagination);
-  show(stateLoading);
-
-  const params = new URLSearchParams({ limit: PAGE_SIZE, offset: state.offset });
+// ── Filter params builder ─────────────────────────────────────
+function buildFilterParams(limit, offset) {
+  const params = new URLSearchParams({ limit, offset });
+  if (state.filterSearch)        params.set("search",        state.filterSearch);
   if (state.filterCity)         params.set("city",          state.filterCity);
   if (state.filterNeighborhood) params.set("neighborhood",  state.filterNeighborhood);
   if (state.filterType)         params.set("listing_type",  state.filterType);
@@ -185,9 +228,18 @@ async function loadListings() {
   if (state.filterSource)       params.set("source",        state.filterSource);
   if (state.filterPropertyType) params.set("property_type", state.filterPropertyType);
   if (state.sortBy)             params.set("sort_by",       state.sortBy);
+  return params;
+}
+
+// ── Listings ──────────────────────────────────────────────────
+async function loadListings() {
+  if (state.viewMode === "map") { await loadAndRenderMap(); return; }
+
+  hide(grid); hide(stateEmpty); hide(stateError); hide(pagination);
+  show(stateLoading);
 
   try {
-    const data = await apiFetch(`/api/listings?${params}`);
+    const data = await apiFetch(`/api/listings?${buildFilterParams(PAGE_SIZE, state.offset)}`);
     state.listings = data.listings;
     state.total    = data.total;
     renderListings();
@@ -265,8 +317,10 @@ function buildCard(l) {
     ? `<a class="card-link" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer">View →</a>`
     : "";
 
+  const imgClass = l.source ? `card-img src-${esc(l.source)}` : "card-img";
+
   card.innerHTML = `
-    <div class="card-img">
+    <div class="${imgClass}">
       ${srcBadge}
       <div class="card-img-icon">${icon}</div>
     </div>
@@ -288,6 +342,135 @@ function buildCard(l) {
     </div>
   `;
   return card;
+}
+
+// ── Map ───────────────────────────────────────────────────────
+let _map        = null;
+let _tileLayer  = null;
+let _mapMarkers = [];
+
+const TILE_DARK  = "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png";
+const TILE_LIGHT = "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png";
+const TILE_ATTR  = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>';
+
+function isDarkTheme() {
+  return document.body.dataset.theme !== "light";
+}
+
+function initMap() {
+  if (_map) return;
+  show(mapContainer);
+  _map = L.map("map-container").setView([35.2271, -80.8431], 11);
+  _tileLayer = L.tileLayer(isDarkTheme() ? TILE_DARK : TILE_LIGHT, {
+    attribution: TILE_ATTR,
+    maxZoom: 19,
+  }).addTo(_map);
+}
+
+function _updateMapTiles() {
+  if (!_map || !_tileLayer) return;
+  _tileLayer.setUrl(isDarkTheme() ? TILE_DARK : TILE_LIGHT);
+}
+
+async function loadAndRenderMap() {
+  hide(grid); hide(stateEmpty); hide(stateError); hide(pagination);
+  show(stateLoading);
+
+  try {
+    const data = await apiFetch(`/api/listings?${buildFilterParams(5000, 0)}`);
+    const listings = data.listings || [];
+
+    hide(stateLoading);
+
+    if (listings.length === 0) {
+      show(stateEmpty);
+      resultCount.textContent = "";
+      return;
+    }
+
+    initMap();
+    show(mapContainer);
+
+    // Clear old markers
+    _mapMarkers.forEach(m => m.remove());
+    _mapMarkers = [];
+
+    listings.forEach(l => {
+      const [lat, lng] = getListingCoords(l);
+      const color      = priceMarkerColor(l.price);
+
+      const marker = L.circleMarker([lat, lng], {
+        radius:      7,
+        fillColor:   color,
+        color:       isDarkTheme() ? "#0f1117" : "#fff",
+        weight:      1.5,
+        opacity:     1,
+        fillOpacity: 0.85,
+      }).addTo(_map);
+
+      const srcLabels = {
+        redfin: "Redfin", zillow: "Zillow", realtor: "Realtor.com",
+        craigslist: "Craigslist", estately: "Estately",
+        apartments: "Apartments.com", searchcharlotte: "SearchCharlotte",
+        homes: "Homes.com",
+      };
+
+      const addrParts = (l.title || "").split(" \u2013 ");
+      const addr      = addrParts[0] || l.title || "Unknown address";
+      const city      = addrParts[1] || "";
+      const meta      = [
+        l.bedrooms  && l.bedrooms  !== "N/A" ? `${l.bedrooms} bd` : "",
+        l.bathrooms && l.bathrooms !== "N/A" ? `${l.bathrooms} ba` : "",
+        l.sqft      && l.sqft      !== "N/A" ? `${Number(l.sqft).toLocaleString()} ft²` : "",
+      ].filter(Boolean).join(" · ");
+
+      const viewLink = l.url
+        ? `<br><a class="map-popup-link" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer">View listing →</a>`
+        : "";
+
+      marker.bindPopup(`
+        <div class="map-popup-price">${esc(fmtPrice(l.price))}</div>
+        <div class="map-popup-addr">${esc(addr)}${city ? `, ${esc(city)}` : ""}</div>
+        <div class="map-popup-meta">${esc(meta) || "Details unavailable"}</div>
+        <span class="source-tag source-${esc(l.source || "")}">${esc(srcLabels[l.source] || l.source || "")}</span>
+        ${viewLink}
+      `, { maxWidth: 240 });
+
+      _mapMarkers.push(marker);
+    });
+
+    resultCount.textContent = `${listings.length.toLocaleString()} listing${listings.length !== 1 ? "s" : ""} on map`;
+
+    // Fit map to markers
+    if (_mapMarkers.length > 0) {
+      const group = L.featureGroup(_mapMarkers);
+      _map.fitBounds(group.getBounds().pad(0.05));
+    }
+  } catch (err) {
+    hide(stateLoading);
+    stateErrorMsg.textContent = err.message;
+    show(stateError);
+  }
+}
+
+// ── View switcher ─────────────────────────────────────────────
+function setView(mode) {
+  state.viewMode = mode;
+  state.offset   = 0;
+
+  $("btn-view-grid").classList.toggle("active", mode === "grid");
+  $("btn-view-map").classList.toggle("active",  mode === "map");
+
+  if (mode === "grid") {
+    hide(mapContainer);
+    hide(mapLegend);
+    loadListings();
+  } else {
+    hide(grid);
+    hide(pagination);
+    show(mapLegend);
+    loadAndRenderMap();
+  }
 }
 
 // ── Scrape ────────────────────────────────────────────────────
@@ -328,7 +511,7 @@ async function pollStatus() {
       state.pollTimer = null;
       state.offset = 0;
       await loadListings();
-      await loadPropertyTypes();  // refresh now that new data is in
+      await loadPropertyTypes();
     }
   } catch { /* silently ignore */ }
 }
@@ -408,32 +591,23 @@ function closeModal(id) { hide($(id)); }
 
 // ── Build export URL from current filters ─────────────────────
 function buildExportParams() {
-  const p = new URLSearchParams();
-  if (state.filterCity)         p.set("city",          state.filterCity);
-  if (state.filterNeighborhood) p.set("neighborhood",  state.filterNeighborhood);
-  if (state.filterType)         p.set("listing_type",  state.filterType);
-  if (state.filterBedrooms)     p.set("bedrooms",      state.filterBedrooms);
-  if (state.filterBathrooms)    p.set("bathrooms",     state.filterBathrooms);
-  if (state.filterMinPrice)     p.set("min_price",     state.filterMinPrice);
-  if (state.filterMaxPrice)     p.set("max_price",     state.filterMaxPrice);
-  if (state.filterMinSqft)      p.set("min_sqft",      state.filterMinSqft);
-  if (state.filterMaxSqft)      p.set("max_sqft",      state.filterMaxSqft);
-  if (state.filterSource)       p.set("source",        state.filterSource);
-  if (state.filterPropertyType) p.set("property_type", state.filterPropertyType);
-  if (state.sortBy)             p.set("sort_by",       state.sortBy);
-  return p;
+  const p = buildFilterParams(5000, 0);
+  p.delete("limit"); p.delete("offset");
+  // re-add with export limits
+  return new URLSearchParams({ ...Object.fromEntries(buildFilterParams(5000, 0)) });
 }
 
 // ── Clear all filters ─────────────────────────────────────────
 function clearFilters() {
   const ids = [
+    "filter-search",
     "filter-city", "filter-neighborhood", "filter-type", "filter-property-type",
     "filter-sort", "filter-bedrooms", "filter-bathrooms", "filter-source",
     "filter-min-price", "filter-max-price", "filter-min-sqft", "filter-max-sqft",
   ];
   ids.forEach(id => { if ($(id)) $(id).value = ""; });
   Object.assign(state, {
-    filterCity: "", filterNeighborhood: "", filterType: "",
+    filterSearch: "", filterCity: "", filterNeighborhood: "", filterType: "",
     filterBedrooms: "", filterBathrooms: "", filterMinPrice: "", filterMaxPrice: "",
     filterMinSqft: "", filterMaxSqft: "", filterSource: "", filterPropertyType: "",
     sortBy: "", offset: 0,
@@ -446,6 +620,11 @@ function wireEvents() {
   $("btn-scrape").addEventListener("click",         () => openModal("modal-scrape"));
   $("btn-scrape-confirm").addEventListener("click", startScrape);
   $("btn-history").addEventListener("click",        showHistory);
+  $("btn-theme").addEventListener("click",          toggleTheme);
+
+  $("btn-view-grid").addEventListener("click", () => setView("grid"));
+  $("btn-view-map").addEventListener("click",  () => setView("map"));
+
   $("btn-refresh").addEventListener("click", async () => {
     const btn = $("btn-refresh");
     btn.disabled = true;
@@ -475,8 +654,8 @@ function wireEvents() {
   ];
   selFilters.forEach(([id, key]) => {
     $(id).addEventListener("change", e => {
-      state[key]    = e.target.value;
-      state.offset  = 0;
+      state[key]   = e.target.value;
+      state.offset = 0;
       loadListings();
     });
   });
@@ -484,6 +663,7 @@ function wireEvents() {
   // Text/number filters (debounced)
   const reloadDb = debounce(() => { state.offset = 0; loadListings(); }, 400);
   [
+    ["filter-search",    "filterSearch"],
     ["filter-min-price", "filterMinPrice"],
     ["filter-max-price", "filterMaxPrice"],
     ["filter-min-sqft",  "filterMinSqft"],
@@ -493,9 +673,21 @@ function wireEvents() {
   });
 
   $("btn-export").addEventListener("click", () => {
-    window.location.href = `/api/export.csv?${buildExportParams()}`;
+    window.location.href = `/api/export.csv?${buildFilterParams(5000, 0)}`;
   });
   $("btn-clear").addEventListener("click", clearFilters);
+  $("btn-clear-db").addEventListener("click", async () => {
+    if (!confirm("Delete ALL listings from the database? This cannot be undone.")) return;
+    try {
+      const res = await apiFetch("/api/listings", { method: "DELETE" });
+      state.offset = 0;
+      await loadListings();
+      await loadPropertyTypes();
+      alert(`Deleted ${res.deleted.toLocaleString()} listing${res.deleted !== 1 ? "s" : ""}.`);
+    } catch (err) {
+      alert("Error clearing database: " + err.message);
+    }
+  });
 
   btnPrev.addEventListener("click", () => {
     state.offset = Math.max(0, state.offset - PAGE_SIZE);
@@ -511,6 +703,10 @@ function wireEvents() {
 
 // ── Boot ──────────────────────────────────────────────────────
 async function init() {
+  // Apply saved theme (default dark)
+  const savedTheme = localStorage.getItem("theme") || "dark";
+  applyTheme(savedTheme);
+
   wireEvents();
   await Promise.all([loadCities(), loadNeighborhoods(), loadPropertyTypes()]);
   await loadListings();

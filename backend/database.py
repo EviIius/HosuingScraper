@@ -173,11 +173,15 @@ _SORT_SQL = {
 def _filter_clauses(
     city, bedrooms, bathrooms, min_price, max_price,
     listing_type, source, zips,
-    property_type=None, min_sqft=None, max_sqft=None,
+    property_type=None, min_sqft=None, max_sqft=None, search=None,
 ):
     """Build WHERE clauses + params used by both list and count queries."""
     query  = ""
     params: list = []
+    if search:
+        query += " AND (LOWER(title) LIKE ? OR LOWER(location) LIKE ?)"
+        term = f"%{search.lower()}%"
+        params.extend([term, term])
     if city:
         query += " AND city = ?"
         params.append(city)
@@ -231,12 +235,13 @@ def get_listings(
     min_sqft: str | None = None,
     max_sqft: str | None = None,
     sort_by: str | None = None,
+    search: str | None = None,
 ) -> list[dict]:
     """Return listings with optional filters."""
     where, params = _filter_clauses(
         city, bedrooms, bathrooms, min_price, max_price,
         listing_type, source, zips,
-        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft,
+        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft, search=search,
     )
     order = _SORT_SQL.get(sort_by or "", "date_scraped DESC")
     query = f"SELECT * FROM listings WHERE 1=1{where} ORDER BY {order} LIMIT ? OFFSET ?"
@@ -260,17 +265,26 @@ def get_listing_count(
     property_type: str | None = None,
     min_sqft: str | None = None,
     max_sqft: str | None = None,
+    search: str | None = None,
 ) -> int:
     """Return total number of listings (optionally filtered)."""
     where, params = _filter_clauses(
         city, bedrooms, bathrooms, min_price, max_price,
         listing_type, source, zips,
-        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft,
+        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft, search=search,
     )
     query = "SELECT COUNT(*) AS count FROM listings WHERE 1=1" + where
     with get_connection(db_path) as conn:
         row = conn.execute(query, params).fetchone()
         return row["count"]
+
+
+def clear_listings(db_path: str = DB_PATH) -> int:
+    """Delete all rows from the listings table. Returns number of rows deleted."""
+    with get_connection(db_path) as conn:
+        cur = conn.execute("DELETE FROM listings")
+        conn.commit()
+        return cur.rowcount
 
 
 def get_property_types(db_path: str = DB_PATH) -> list[str]:

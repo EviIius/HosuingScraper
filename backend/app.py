@@ -20,6 +20,7 @@ from flask import Flask, jsonify, make_response, request, send_from_directory
 from flask_cors import CORS
 
 from database import (
+    clear_listings,
     get_listing_count,
     get_listings,
     get_property_types,
@@ -265,6 +266,7 @@ def api_listings():
     min_sqft      = request.args.get("min_sqft")      or None
     max_sqft      = request.args.get("max_sqft")      or None
     sort_by       = request.args.get("sort_by")       or None
+    search        = request.args.get("search")        or None
     zips          = _resolve_zips(request.args.get("neighborhood"), request.args.get("zips"))
     limit         = min(int(request.args.get("limit",  50)), 200)
     offset        = max(int(request.args.get("offset",  0)),   0)
@@ -274,13 +276,13 @@ def api_listings():
         min_price=min_price, max_price=max_price,
         limit=limit, offset=offset, listing_type=listing_type, source=source,
         zips=zips, property_type=property_type,
-        min_sqft=min_sqft, max_sqft=max_sqft, sort_by=sort_by,
+        min_sqft=min_sqft, max_sqft=max_sqft, sort_by=sort_by, search=search,
     )
     total = get_listing_count(
         city=city, bedrooms=bedrooms, bathrooms=bathrooms,
         min_price=min_price, max_price=max_price,
         listing_type=listing_type, source=source, zips=zips,
-        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft,
+        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft, search=search,
     )
 
     return jsonify({"listings": data, "total": total, "limit": limit, "offset": offset})
@@ -388,6 +390,12 @@ def api_scrape():
 def api_status():
     with _scrape_lock:
         return jsonify(dict(scrape_status))
+
+
+@app.route("/api/listings", methods=["DELETE"])
+def api_clear_listings():
+    deleted = clear_listings()
+    return jsonify({"deleted": deleted})
 
 
 @app.route("/api/history", methods=["GET"])

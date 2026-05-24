@@ -859,47 +859,71 @@ def scrape_zillow_charlotte(
     seen_urls:    set[str]   = set()
     succeeded_zips: list[int] = []
 
-    def _scrape_zip(sb, zipcode: int, idx: int, total: int) -> tuple[list[dict], bool]:
-        """Fetch one ZIP; returns (rows, was_blocked)."""
-        url = f"{_ZILLOW_BASE}/{path_prefix}/{zipcode}_rb/{price_seg}"
+    def _scrape_page(zipcode: int, page: int) -> tuple[list[dict], bool]:
+        """Fetch a single page in a fresh browser session. Returns (rows, was_blocked)."""
+        page_suffix = "" if page == 1 else f"{page}_p/"
+        url = f"{_ZILLOW_BASE}/{path_prefix}/{zipcode}_rb/{price_seg}{page_suffix}"
         for attempt in range(1, 3):
             try:
-                sb.uc_open_with_reconnect(url, reconnect_time=_SB_RECONNECT)
-                sb.sleep(3 if attempt == 1 else 8)
+                with _open_uc_session() as sb:
+                    try:
+                        sb.uc_open_with_reconnect(url, reconnect_time=_SB_RECONNECT)
+                        sb.sleep(3 if attempt == 1 else 8)
+                    except Exception as exc:
+                        logger.warning("[zillow] ZIP %s p%d attempt %d nav failed: %s", zipcode, page, attempt, exc)
+                        return [], True
+                    html = sb.get_page_source()
+            except RuntimeError:
+                raise
             except Exception as exc:
-                logger.warning("[zillow] ZIP %s attempt %d nav failed: %s", zipcode, attempt, exc)
+                logger.error("[zillow] ZIP %s p%d session error: %s", zipcode, page, exc)
                 return [], True
-            html = sb.get_page_source()
+
             if "Access to this page has been denied" in html or "__NEXT_DATA__" not in html:
-                logger.warning("[zillow] ZIP %s attempt %d bot-blocked; retrying…", zipcode, attempt)
-                time.sleep(random.uniform(8.0, 12.0))
+                logger.warning("[zillow] ZIP %s p%d attempt %d bot-blocked; retrying…", zipcode, page, attempt)
+                time.sleep(random.uniform(10.0, 16.0))
                 continue
+
             rows = _parse_zillow_next_data(html, listing_type, now, seen_urls)
-            logger.info("[zillow] ZIP %s (%d/%d): %d listings (total so far %d)",
-                        zipcode, idx, total, len(rows), len(all_listings) + len(rows))
+            logger.info("[zillow] ZIP %s p%d/%d: %d listings", zipcode, page, max_pages, len(rows))
             return rows, False
-        logger.warning("[zillow] ZIP %s blocked on both attempts — skipped this run", zipcode)
+
+        logger.warning("[zillow] ZIP %s p%d blocked on all attempts", zipcode, page)
         return [], True
 
-    # Each ZIP gets its own fresh browser session so Zillow never sees
-    # consecutive requests from the same session fingerprint.
+    # Each page gets a completely fresh browser session — fresh fingerprint
+    # means Zillow sees each page request as a new visitor, not a paginating bot.
     for idx, zipcode in enumerate(zips, 1):
-        _emit_progress(progress_cb, idx, len(zips), f"ZIP {zipcode}")
-        try:
-            with _open_uc_session() as sb:
-                rows, blocked = _scrape_zip(sb, zipcode, idx, len(zips))
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            logger.error("[zillow] ZIP %s session error: %s", zipcode, exc)
-            blocked = True
-            rows = []
+        zip_listings: list[dict] = []
+        zip_succeeded = False
 
-        if not blocked:
-            all_listings.extend(rows)
+        for page in range(1, max_pages + 1):
+            _emit_progress(progress_cb, idx, len(zips), f"ZIP {zipcode} p{page}/{max_pages}")
+            rows, blocked = _scrape_page(zipcode, page)
+
+            if blocked:
+                if page == 1:
+                    logger.warning("[zillow] ZIP %s p1 blocked — skipping ZIP", zipcode)
+                else:
+                    logger.warning("[zillow] ZIP %s blocked at p%d — stopping", zipcode, page)
+                break
+
+            zip_succeeded = True
+            zip_listings.extend(rows)
+
+            if len(rows) == 0:
+                logger.info("[zillow] ZIP %s p%d empty — end of listings", zipcode, page)
+                break
+
+            # Pause between page sessions so Zillow doesn't correlate them by timing
+            if page < max_pages:
+                time.sleep(random.uniform(4.0, 8.0))
+
+        if zip_succeeded:
+            all_listings.extend(zip_listings)
             succeeded_zips.append(zipcode)
 
-        # Brief pause between browser launches so Chrome/Zillow don't overlap
+        # Pause between ZIPs
         if idx < len(zips):
             time.sleep(random.uniform(3.0, 6.0))
 
@@ -1408,7 +1432,7 @@ def scrape_estately_charlotte(
 
             parts    = [p.strip() for p in address_text.split(",")]
             city_raw = parts[-2] if len(parts) >= 3 else "Charlotte"
-            zip_clean = _extract_zip(parts[-1] if parts else "", address_text)
+            zip_clean = _extract_zip(parts[-1] if parts else "", address_text, href)
 
             seen_urls.add(href)
             all_listings.append({

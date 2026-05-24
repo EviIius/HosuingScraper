@@ -46,3 +46,6 @@ htmlcov/
 
 # Logs
 *.log
+
+# SeleniumBase / browser driver artifacts
+backend/downloaded_files/
