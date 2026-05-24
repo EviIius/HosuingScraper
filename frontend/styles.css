@@ -224,6 +224,12 @@ a:hover { text-decoration: underline; }
   font-size: .74rem;
   color: var(--text-muted);
 }
+.scrape-stopwatch {
+  font-weight: 700;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  font-size: .74rem;
+}
 #scrape-progress-percent {
   font-weight: 700;
   color: var(--primary);
@@ -278,7 +284,7 @@ a:hover { text-decoration: underline; }
 }
 .view-btn:not(.active):hover { background: var(--surface-2); color: var(--text); }
 
-/* Map legend */
+/* Map legend — sits below the view-bar, shown only in map mode */
 .map-legend {
   display: flex;
   align-items: center;
@@ -286,7 +292,9 @@ a:hover { text-decoration: underline; }
   flex-wrap: wrap;
   font-size: .73rem;
   color: var(--text-muted);
-  margin-left: auto;
+  padding: .35rem 1.25rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
 }
 .legend-dot {
   display: inline-block;
@@ -314,6 +322,12 @@ a:hover { text-decoration: underline; }
   align-items: flex-end;
   gap: .6rem;
   flex-wrap: wrap;
+}
+
+.filter-group--zip {
+  min-width: 90px;
+  max-width: 110px;
+  flex: 0 0 100px;
 }
 
 .filter-group--search {
@@ -401,6 +415,7 @@ a:hover { text-decoration: underline; }
 .map-popup-addr { font-weight: 600; margin: .2rem 0 .35rem; }
 .map-popup-meta { color: var(--text-muted); font-size: .78rem; margin-bottom: .35rem; }
 .map-popup-link { font-size: .78rem; font-weight: 600; color: var(--primary); }
+.map-popup-links { margin-top: .35rem; display: flex; flex-direction: column; gap: .2rem; }
 
 /* ── Listing Card ───────────────────────────────────────────── */
 .card {
@@ -671,6 +686,53 @@ a:hover { text-decoration: underline; }
   font-weight: 500;
   border: 1px solid var(--border);
 }
+
+/* ── Table View ─────────────────────────────────────────────── */
+#table-container {
+  overflow-x: auto;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+.listings-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .82rem;
+}
+.listings-table th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-size: .7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  padding: .55rem .75rem;
+  text-align: left;
+  border-bottom: 2px solid var(--border);
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+.listings-table th:hover { color: var(--text); }
+.listings-table th.sort-asc::after  { content: " ↑"; color: var(--primary); }
+.listings-table th.sort-desc::after { content: " ↓"; color: var(--primary); }
+.listings-table td {
+  padding: .48rem .75rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+  white-space: nowrap;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.listings-table tr:last-child td { border-bottom: none; }
+.listings-table tbody tr:hover { background: var(--surface-2); }
+.listings-table .col-price { font-weight: 700; color: var(--primary); }
+.listings-table .col-addr  { max-width: 220px; }
+.listings-table .col-link  { font-weight: 600; color: var(--primary); }
+.listings-table .col-link:hover { text-decoration: underline; }
 
 /* ── Footer ─────────────────────────────────────────────────── */
 .site-footer {

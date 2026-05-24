@@ -54,13 +54,23 @@ const ZIP_CENTROIDS = {
   "28075": [35.3220, -80.6470],
 };
 
+function _hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  return h >>> 0;
+}
+
 function getListingCoords(listing) {
   const zip  = String(listing.zip || "").trim();
   const base = ZIP_CENTROIDS[zip] || [35.2271, -80.8431];
-  const jitter = ZIP_CENTROIDS[zip] ? 0.004 : 0.06;
+  // Deterministic offset from URL so pins stay in place across refreshes
+  const seed = listing.url || listing.title || "";
+  const h1   = _hashStr(seed);
+  const h2   = _hashStr(seed + "~lng");
+  const spread = 0.018; // ~2km spread across each ZIP area
   return [
-    base[0] + (Math.random() - 0.5) * jitter * 2,
-    base[1] + (Math.random() - 0.5) * jitter * 2,
+    base[0] + ((h1 / 0xffffffff) - 0.5) * spread * 2,
+    base[1] + ((h2 / 0xffffffff) - 0.5) * spread * 2,
   ];
 }
 
@@ -83,6 +93,7 @@ let state = {
   filterCity:          "",
   filterNeighborhood:  "",
   filterSearch:        "",
+  filterZip:           "",
   filterType:          "",
   filterBedrooms:      "",
   filterBathrooms:     "",
@@ -101,8 +112,9 @@ let state = {
 // ── DOM refs ──────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 
-const grid          = $("listings-grid");
-const mapContainer  = $("map-container");
+const grid           = $("listings-grid");
+const mapContainer   = $("map-container");
+const tableContainer = $("table-container");
 const mapLegend     = $("map-legend");
 const stateLoading  = $("state-loading");
 const stateEmpty    = $("state-empty");
@@ -216,6 +228,7 @@ async function loadPropertyTypes() {
 function buildFilterParams(limit, offset) {
   const params = new URLSearchParams({ limit, offset });
   if (state.filterSearch)        params.set("search",        state.filterSearch);
+  if (state.filterZip)           params.set("zip_filter",    state.filterZip);
   if (state.filterCity)         params.set("city",          state.filterCity);
   if (state.filterNeighborhood) params.set("neighborhood",  state.filterNeighborhood);
   if (state.filterType)         params.set("listing_type",  state.filterType);
@@ -233,7 +246,8 @@ function buildFilterParams(limit, offset) {
 
 // ── Listings ──────────────────────────────────────────────────
 async function loadListings() {
-  if (state.viewMode === "map") { await loadAndRenderMap(); return; }
+  if (state.viewMode === "map")   { await loadAndRenderMap(); return; }
+  if (state.viewMode === "table") { await loadAndRenderTable(); return; }
 
   hide(grid); hide(stateEmpty); hide(stateError); hide(pagination);
   show(stateLoading);
@@ -252,6 +266,7 @@ async function loadListings() {
 
 function renderListings() {
   hide(stateLoading);
+  hide(tableContainer);
   grid.innerHTML = "";
 
   if (state.listings.length === 0) {
@@ -344,6 +359,126 @@ function buildCard(l) {
   return card;
 }
 
+// ── Table View ────────────────────────────────────────────────
+const TABLE_PAGE_SIZE = 100;
+let _tableSort = { col: "price", dir: "desc" };
+
+const TABLE_COLS = [
+  { key: "price",         label: "Price",        sortable: true  },
+  { key: "title",         label: "Address",      sortable: true  },
+  { key: "city",          label: "City",         sortable: true  },
+  { key: "zip",           label: "ZIP",          sortable: true  },
+  { key: "bedrooms",      label: "Beds",         sortable: true  },
+  { key: "bathrooms",     label: "Baths",        sortable: true  },
+  { key: "sqft",          label: "Sqft",         sortable: true  },
+  { key: "property_type", label: "Type",         sortable: true  },
+  { key: "listing_type",  label: "Sale/Rent",    sortable: false },
+  { key: "source",        label: "Source",       sortable: true  },
+  { key: "date_scraped",  label: "Scraped",      sortable: true  },
+  { key: "url",           label: "Link",         sortable: false },
+];
+
+function _tableSortListings(rows) {
+  const { col, dir } = _tableSort;
+  return [...rows].sort((a, b) => {
+    let av = a[col] ?? "", bv = b[col] ?? "";
+    if (col === "price" || col === "sqft" || col === "bedrooms" || col === "bathrooms") {
+      av = parseFloat(String(av).replace(/,/g, "")) || 0;
+      bv = parseFloat(String(bv).replace(/,/g, "")) || 0;
+    } else {
+      av = String(av).toLowerCase();
+      bv = String(bv).toLowerCase();
+    }
+    if (av < bv) return dir === "asc" ? -1 : 1;
+    if (av > bv) return dir === "asc" ? 1 : -1;
+    return 0;
+  });
+}
+
+async function loadAndRenderTable() {
+  hide(grid); hide(mapContainer); hide(stateEmpty); hide(stateError); hide(pagination);
+  show(stateLoading);
+
+  try {
+    const data = await apiFetch(`/api/listings?${buildFilterParams(2000, 0)}`);
+    const listings = data.total > 0 ? data.listings : [];
+
+    if (data.total > 2000) {
+      const rest = await apiFetch(`/api/listings?${buildFilterParams(data.total, 0)}`);
+      listings.push(...rest.listings.slice(2000));
+    }
+
+    hide(stateLoading);
+    if (listings.length === 0) { show(stateEmpty); resultCount.textContent = ""; return; }
+
+    const sorted = _tableSortListings(listings);
+    const srcLabels = {
+      redfin: "Redfin", zillow: "Zillow", realtor: "Realtor.com",
+      craigslist: "Craigslist", estately: "Estately",
+      apartments: "Apartments.com", searchcharlotte: "SearchCharlotte", homes: "Homes.com",
+    };
+
+    const thead = TABLE_COLS.map(c => {
+      const cls = c.sortable
+        ? (_tableSort.col === c.key ? ` class="sort-${_tableSort.dir}"` : "")
+        : "";
+      const sortAttr = c.sortable ? ` data-col="${c.key}"` : "";
+      return `<th${cls}${sortAttr}>${c.label}</th>`;
+    }).join("");
+
+    const tbody = sorted.map(l => {
+      const addrParts = (l.title || "").split(" – ");
+      const addr = addrParts[0] || l.title || "";
+      const typeLabel = l.listing_type === "for_rent"
+        ? `<span class="type-badge type-rent">Rent</span>`
+        : `<span class="type-badge type-sale">Sale</span>`;
+      const srcBadge = l.source
+        ? `<span class="source-tag source-${esc(l.source)}">${esc(srcLabels[l.source] || l.source)}</span>`
+        : "";
+      const link = l.url
+        ? `<a class="col-link" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer">View →</a>`
+        : "";
+      return `<tr>
+        <td class="col-price">${esc(fmtPrice(l.price))}</td>
+        <td class="col-addr" title="${esc(addr)}">${esc(addr)}</td>
+        <td>${esc(l.city || "")}</td>
+        <td>${esc(l.zip || "")}</td>
+        <td>${esc(l.bedrooms || "")}</td>
+        <td>${esc(l.bathrooms || "")}</td>
+        <td>${l.sqft && l.sqft !== "N/A" ? Number(l.sqft).toLocaleString() : ""}</td>
+        <td>${esc(l.property_type || "")}</td>
+        <td>${typeLabel}</td>
+        <td>${srcBadge}</td>
+        <td>${fmtDate(l.date_scraped)}</td>
+        <td>${link}</td>
+      </tr>`;
+    }).join("");
+
+    tableContainer.innerHTML = `
+      <table class="listings-table">
+        <thead><tr>${thead}</tr></thead>
+        <tbody>${tbody}</tbody>
+      </table>`;
+
+    tableContainer.querySelectorAll("th[data-col]").forEach(th => {
+      th.addEventListener("click", () => {
+        const col = th.dataset.col;
+        _tableSort = _tableSort.col === col && _tableSort.dir === "desc"
+          ? { col, dir: "asc" }
+          : { col, dir: "desc" };
+        loadAndRenderTable();
+      });
+    });
+
+    show(tableContainer);
+    resultCount.textContent = `${sorted.length.toLocaleString()} listings`;
+  } catch (err) {
+    hide(stateLoading);
+    stateErrorMsg.textContent = err.message;
+    show(stateError);
+  }
+}
+
 // ── Map ───────────────────────────────────────────────────────
 let _map        = null;
 let _tileLayer  = null;
@@ -388,6 +523,40 @@ async function loadAndRenderMap() {
       return;
     }
 
+    // Deduplicate by address for the map — same property listed on multiple
+    // sources would otherwise appear as several scattered jittered pins.
+    // Key on normalized address (strip unit formatting noise), keep the entry
+    // with the most detail (prefer whichever has beds/baths/sqft filled in).
+    const SOURCE_PRIORITY = ["zillow","redfin","realtor","estately","searchcharlotte","homes","apartments","craigslist"];
+    function addrKey(l) {
+      return (l.title || "").toLowerCase()
+        .replace(/\s+/g, " ")
+        .replace(/\bapt\.?\b|\bunit\b|\bste\.?\b|\s*#\s*/gi, " ")
+        .replace(/\xa0/g, " ")
+        .trim();
+    }
+    const seen = new Map();
+    for (const l of listings) {
+      const key = addrKey(l);
+      if (!seen.has(key)) {
+        seen.set(key, { primary: l, sources: [{ source: l.source, url: l.url }] });
+        continue;
+      }
+      const entry = seen.get(key);
+      if (l.url && !entry.sources.find(s => s.url === l.url)) {
+        entry.sources.push({ source: l.source, url: l.url });
+      }
+      const existing = entry.primary;
+      const existingPri = SOURCE_PRIORITY.indexOf(existing.source);
+      const newPri      = SOURCE_PRIORITY.indexOf(l.source);
+      const existingDetail = [existing.bedrooms, existing.bathrooms, existing.sqft].filter(Boolean).length;
+      const newDetail      = [l.bedrooms,        l.bathrooms,        l.sqft       ].filter(Boolean).length;
+      if (newDetail > existingDetail || (newDetail === existingDetail && newPri < existingPri)) {
+        entry.primary = l;
+      }
+    }
+    const dedupedListings = Array.from(seen.values());
+
     initMap();
     show(mapContainer);
 
@@ -395,7 +564,15 @@ async function loadAndRenderMap() {
     _mapMarkers.forEach(m => m.remove());
     _mapMarkers = [];
 
-    listings.forEach(l => {
+    const srcLabels = {
+      redfin: "Redfin", zillow: "Zillow", realtor: "Realtor.com",
+      craigslist: "Craigslist", estately: "Estately",
+      apartments: "Apartments.com", searchcharlotte: "SearchCharlotte",
+      homes: "Homes.com",
+    };
+
+    dedupedListings.forEach(entry => {
+      const l = entry.primary;
       const [lat, lng] = getListingCoords(l);
       const color      = priceMarkerColor(l.price);
 
@@ -408,13 +585,6 @@ async function loadAndRenderMap() {
         fillOpacity: 0.85,
       }).addTo(_map);
 
-      const srcLabels = {
-        redfin: "Redfin", zillow: "Zillow", realtor: "Realtor.com",
-        craigslist: "Craigslist", estately: "Estately",
-        apartments: "Apartments.com", searchcharlotte: "SearchCharlotte",
-        homes: "Homes.com",
-      };
-
       const addrParts = (l.title || "").split(" \u2013 ");
       const addr      = addrParts[0] || l.title || "Unknown address";
       const city      = addrParts[1] || "";
@@ -424,22 +594,22 @@ async function loadAndRenderMap() {
         l.sqft      && l.sqft      !== "N/A" ? `${Number(l.sqft).toLocaleString()} ft²` : "",
       ].filter(Boolean).join(" · ");
 
-      const viewLink = l.url
-        ? `<br><a class="map-popup-link" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer">View listing →</a>`
-        : "";
+      const viewLinks = entry.sources
+        .filter(s => s.url)
+        .map(s => `<a class="map-popup-link" href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">View on ${esc(srcLabels[s.source] || s.source)} →</a>`)
+        .join("<br>");
 
       marker.bindPopup(`
         <div class="map-popup-price">${esc(fmtPrice(l.price))}</div>
         <div class="map-popup-addr">${esc(addr)}${city ? `, ${esc(city)}` : ""}</div>
         <div class="map-popup-meta">${esc(meta) || "Details unavailable"}</div>
-        <span class="source-tag source-${esc(l.source || "")}">${esc(srcLabels[l.source] || l.source || "")}</span>
-        ${viewLink}
+        ${viewLinks ? `<div class="map-popup-links">${viewLinks}</div>` : ""}
       `, { maxWidth: 240 });
 
       _mapMarkers.push(marker);
     });
 
-    resultCount.textContent = `${listings.length.toLocaleString()} listing${listings.length !== 1 ? "s" : ""} on map`;
+    resultCount.textContent = `${dedupedListings.length.toLocaleString()} listing${dedupedListings.length !== 1 ? "s" : ""} on map`;
 
     // Fit map to markers
     if (_mapMarkers.length > 0) {
@@ -458,19 +628,48 @@ function setView(mode) {
   state.viewMode = mode;
   state.offset   = 0;
 
-  $("btn-view-grid").classList.toggle("active", mode === "grid");
-  $("btn-view-map").classList.toggle("active",  mode === "map");
+  $("btn-view-grid").classList.toggle("active",  mode === "grid");
+  $("btn-view-map").classList.toggle("active",   mode === "map");
+  $("btn-view-table").classList.toggle("active", mode === "table");
 
-  if (mode === "grid") {
-    hide(mapContainer);
-    hide(mapLegend);
-    loadListings();
-  } else {
-    hide(grid);
-    hide(pagination);
+  hide(grid); hide(mapContainer); hide(tableContainer); hide(mapLegend); hide(pagination);
+
+  if (mode === "map") {
     show(mapLegend);
     loadAndRenderMap();
+  } else if (mode === "table") {
+    loadAndRenderTable();
+  } else {
+    loadListings();
   }
+}
+
+// ── Stopwatch ─────────────────────────────────────────────────
+let _stopwatchTimer = null;
+let _stopwatchStart = null;
+
+function _fmtElapsed(ms) {
+  const total = Math.floor(ms / 1000);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function startStopwatch() {
+  _stopwatchStart = Date.now();
+  const el = $("scrape-stopwatch");
+  show(el);
+  el.textContent = "⏱ 0:00";
+  if (_stopwatchTimer) clearInterval(_stopwatchTimer);
+  _stopwatchTimer = setInterval(() => {
+    el.textContent = "⏱ " + _fmtElapsed(Date.now() - _stopwatchStart);
+  }, 1000);
+}
+
+function stopStopwatch() {
+  if (_stopwatchTimer) { clearInterval(_stopwatchTimer); _stopwatchTimer = null; }
+  const el = $("scrape-stopwatch");
+  if (_stopwatchStart) el.textContent = "⏱ " + _fmtElapsed(Date.now() - _stopwatchStart) + " ✓";
 }
 
 // ── Scrape ────────────────────────────────────────────────────
@@ -488,6 +687,7 @@ async function startScrape() {
       body:    JSON.stringify({ source, listing_type: listType, max_pages: maxPages, min_price: minPrice, max_price: maxPrice }),
     });
     closeModal("modal-scrape");
+    startStopwatch();
     startPolling();
   } catch (err) {
     alert("Could not start scrape: " + err.message);
@@ -509,6 +709,7 @@ async function pollStatus() {
     if (!s.running) {
       clearInterval(state.pollTimer);
       state.pollTimer = null;
+      stopStopwatch();
       state.offset = 0;
       await loadListings();
       await loadPropertyTypes();
@@ -600,14 +801,14 @@ function buildExportParams() {
 // ── Clear all filters ─────────────────────────────────────────
 function clearFilters() {
   const ids = [
-    "filter-search",
+    "filter-search", "filter-zip",
     "filter-city", "filter-neighborhood", "filter-type", "filter-property-type",
     "filter-sort", "filter-bedrooms", "filter-bathrooms", "filter-source",
     "filter-min-price", "filter-max-price", "filter-min-sqft", "filter-max-sqft",
   ];
   ids.forEach(id => { if ($(id)) $(id).value = ""; });
   Object.assign(state, {
-    filterSearch: "", filterCity: "", filterNeighborhood: "", filterType: "",
+    filterSearch: "", filterZip: "", filterCity: "", filterNeighborhood: "", filterType: "",
     filterBedrooms: "", filterBathrooms: "", filterMinPrice: "", filterMaxPrice: "",
     filterMinSqft: "", filterMaxSqft: "", filterSource: "", filterPropertyType: "",
     sortBy: "", offset: 0,
@@ -622,8 +823,9 @@ function wireEvents() {
   $("btn-history").addEventListener("click",        showHistory);
   $("btn-theme").addEventListener("click",          toggleTheme);
 
-  $("btn-view-grid").addEventListener("click", () => setView("grid"));
-  $("btn-view-map").addEventListener("click",  () => setView("map"));
+  $("btn-view-grid").addEventListener("click",  () => setView("grid"));
+  $("btn-view-map").addEventListener("click",   () => setView("map"));
+  $("btn-view-table").addEventListener("click", () => setView("table"));
 
   $("btn-refresh").addEventListener("click", async () => {
     const btn = $("btn-refresh");
@@ -664,6 +866,7 @@ function wireEvents() {
   const reloadDb = debounce(() => { state.offset = 0; loadListings(); }, 400);
   [
     ["filter-search",    "filterSearch"],
+    ["filter-zip",       "filterZip"],
     ["filter-min-price", "filterMinPrice"],
     ["filter-max-price", "filterMaxPrice"],
     ["filter-min-sqft",  "filterMinSqft"],

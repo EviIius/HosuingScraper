@@ -76,6 +76,8 @@ def init_db(db_path: str = DB_PATH) -> None:
         _add_column_if_missing(conn, "listings", "listing_type",  "TEXT DEFAULT 'for_sale'")
         _add_column_if_missing(conn, "listings", "property_type", "TEXT")
         _add_column_if_missing(conn, "listings", "zip",           "TEXT")
+        _add_column_if_missing(conn, "listings", "lat",           "REAL")
+        _add_column_if_missing(conn, "listings", "lng",           "REAL")
         # Backfill ZIP for any pre-existing rows by parsing it out of location/title
         _backfill_zips(conn)
     logger.info("Database initialised at %s", db_path)
@@ -173,15 +175,18 @@ _SORT_SQL = {
 def _filter_clauses(
     city, bedrooms, bathrooms, min_price, max_price,
     listing_type, source, zips,
-    property_type=None, min_sqft=None, max_sqft=None, search=None,
+    property_type=None, min_sqft=None, max_sqft=None, search=None, zip_filter=None,
 ):
     """Build WHERE clauses + params used by both list and count queries."""
     query  = ""
     params: list = []
     if search:
-        query += " AND (LOWER(title) LIKE ? OR LOWER(location) LIKE ?)"
+        query += " AND (LOWER(title) LIKE ? OR LOWER(location) LIKE ? OR zip LIKE ?)"
         term = f"%{search.lower()}%"
-        params.extend([term, term])
+        params.extend([term, term, term])
+    if zip_filter:
+        query += " AND zip = ?"
+        params.append(zip_filter.strip())
     if city:
         query += " AND city = ?"
         params.append(city)
@@ -236,12 +241,14 @@ def get_listings(
     max_sqft: str | None = None,
     sort_by: str | None = None,
     search: str | None = None,
+    zip_filter: str | None = None,
 ) -> list[dict]:
     """Return listings with optional filters."""
     where, params = _filter_clauses(
         city, bedrooms, bathrooms, min_price, max_price,
         listing_type, source, zips,
-        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft, search=search,
+        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft,
+        search=search, zip_filter=zip_filter,
     )
     order = _SORT_SQL.get(sort_by or "", "date_scraped DESC")
     query = f"SELECT * FROM listings WHERE 1=1{where} ORDER BY {order} LIMIT ? OFFSET ?"
@@ -266,12 +273,14 @@ def get_listing_count(
     min_sqft: str | None = None,
     max_sqft: str | None = None,
     search: str | None = None,
+    zip_filter: str | None = None,
 ) -> int:
     """Return total number of listings (optionally filtered)."""
     where, params = _filter_clauses(
         city, bedrooms, bathrooms, min_price, max_price,
         listing_type, source, zips,
-        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft, search=search,
+        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft,
+        search=search, zip_filter=zip_filter,
     )
     query = "SELECT COUNT(*) AS count FROM listings WHERE 1=1" + where
     with get_connection(db_path) as conn:
@@ -285,6 +294,22 @@ def clear_listings(db_path: str = DB_PATH) -> int:
         cur = conn.execute("DELETE FROM listings")
         conn.commit()
         return cur.rowcount
+
+
+def get_ungeocoded_listings(limit: int = 500, db_path: str = DB_PATH) -> list[dict]:
+    """Return listings that have no lat/lng stored yet."""
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, title, location, zip FROM listings WHERE lat IS NULL OR lng IS NULL LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_listing_coords(listing_id: int, lat: float, lng: float, db_path: str = DB_PATH) -> None:
+    with get_connection(db_path) as conn:
+        conn.execute("UPDATE listings SET lat=?, lng=? WHERE id=?", (lat, lng, listing_id))
+        conn.commit()
 
 
 def get_property_types(db_path: str = DB_PATH) -> list[str]:

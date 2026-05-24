@@ -267,6 +267,7 @@ def api_listings():
     max_sqft      = request.args.get("max_sqft")      or None
     sort_by       = request.args.get("sort_by")       or None
     search        = request.args.get("search")        or None
+    zip_filter    = request.args.get("zip_filter")    or None
     zips          = _resolve_zips(request.args.get("neighborhood"), request.args.get("zips"))
     limit         = min(int(request.args.get("limit",  50)), 200)
     offset        = max(int(request.args.get("offset",  0)),   0)
@@ -277,12 +278,14 @@ def api_listings():
         limit=limit, offset=offset, listing_type=listing_type, source=source,
         zips=zips, property_type=property_type,
         min_sqft=min_sqft, max_sqft=max_sqft, sort_by=sort_by, search=search,
+        zip_filter=zip_filter,
     )
     total = get_listing_count(
         city=city, bedrooms=bedrooms, bathrooms=bathrooms,
         min_price=min_price, max_price=max_price,
         listing_type=listing_type, source=source, zips=zips,
-        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft, search=search,
+        property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft,
+        search=search, zip_filter=zip_filter,
     )
 
     return jsonify({"listings": data, "total": total, "limit": limit, "offset": offset})
@@ -423,6 +426,16 @@ def api_neighborhoods():
 def api_zillow_zips():
     """Return Zillow ZIP coverage — when each ZIP was last successfully scraped."""
     return jsonify(get_zillow_zip_coverage())
+
+
+@app.route("/api/geocode-status", methods=["GET"])
+def api_geocode_status():
+    from database import get_ungeocoded_listings
+    import sqlite3
+    with get_connection() as conn:
+        total   = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
+        coded   = conn.execute("SELECT COUNT(*) FROM listings WHERE lat IS NOT NULL AND lng IS NOT NULL").fetchone()[0]
+    return jsonify({"total": total, "geocoded": coded, "pending": total - coded})
 
 
 # ---------------------------------------------------------------------------

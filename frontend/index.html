@@ -31,6 +31,7 @@
       </div>
       <div class="scrape-progress-meta">
         <span id="scrape-progress-label">Starting…</span>
+        <span id="scrape-stopwatch" class="scrape-stopwatch hidden">⏱ 0:00</span>
         <span id="scrape-progress-percent">0%</span>
       </div>
     </div>
@@ -100,6 +101,11 @@
         <div class="filter-group filter-group--search">
           <label class="form-label" for="filter-search">Search Address</label>
           <input id="filter-search" class="form-input" type="text" placeholder="Street, city, ZIP…" />
+        </div>
+
+        <div class="filter-group filter-group--zip">
+          <label class="form-label" for="filter-zip">ZIP Code</label>
+          <input id="filter-zip" class="form-input" type="text" placeholder="e.g. 28203" maxlength="5" />
         </div>
 
         <div class="filter-group">
@@ -216,17 +222,18 @@
   <!-- ===== VIEW TOGGLE ===== -->
   <div class="view-bar">
     <div class="view-toggle">
-      <button id="btn-view-grid" class="view-btn active">⊞ Grid</button>
-      <button id="btn-view-map"  class="view-btn">🗺 Map</button>
+      <button id="btn-view-grid"  class="view-btn active">⊞ Grid</button>
+      <button id="btn-view-map"   class="view-btn">🗺 Map</button>
+      <button id="btn-view-table" class="view-btn">☰ Table</button>
     </div>
-    <div id="map-legend" class="map-legend hidden">
-      <span class="legend-dot" style="background:#22d3ee"></span>&lt;$300k
-      <span class="legend-dot" style="background:#4ade80"></span>$300–400k
-      <span class="legend-dot" style="background:#86efac"></span>$400–500k
-      <span class="legend-dot" style="background:#fbbf24"></span>$500–600k
-      <span class="legend-dot" style="background:#f97316"></span>$600–700k
-      <span class="legend-dot" style="background:#f87171"></span>&gt;$700k
-    </div>
+  </div>
+  <div id="map-legend" class="map-legend hidden">
+    <span class="legend-dot" style="background:#22d3ee"></span>&lt;$300k
+    <span class="legend-dot" style="background:#4ade80"></span>$300–400k
+    <span class="legend-dot" style="background:#86efac"></span>$400–500k
+    <span class="legend-dot" style="background:#fbbf24"></span>$500–600k
+    <span class="legend-dot" style="background:#f97316"></span>$600–700k
+    <span class="legend-dot" style="background:#f87171"></span>&gt;$700k
   </div>
 
   <!-- ===== MAIN ===== -->
@@ -234,6 +241,8 @@
     <div id="listings-grid" class="listings-grid"></div>
 
     <div id="map-container" class="hidden"></div>
+
+    <div id="table-container" class="hidden"></div>
 
     <div id="state-loading" class="state-panel hidden">
       <div class="spinner"></div>
