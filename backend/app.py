@@ -30,6 +30,7 @@ from database import (
     init_db,
     log_scrape,
     mark_zillow_zips_scraped,
+    set_listing_tag,
     upsert_listings,
 )
 from scraper import (
@@ -269,6 +270,7 @@ def api_listings():
     search        = request.args.get("search")        or None
     zip_filter    = request.args.get("zip_filter")    or None
     zips          = _resolve_zips(request.args.get("neighborhood"), request.args.get("zips"))
+    user_tag      = request.args.get("user_tag")      or None
     limit         = min(int(request.args.get("limit",  50)), 200)
     offset        = max(int(request.args.get("offset",  0)),   0)
 
@@ -278,17 +280,28 @@ def api_listings():
         limit=limit, offset=offset, listing_type=listing_type, source=source,
         zips=zips, property_type=property_type,
         min_sqft=min_sqft, max_sqft=max_sqft, sort_by=sort_by, search=search,
-        zip_filter=zip_filter,
+        zip_filter=zip_filter, user_tag=user_tag,
     )
     total = get_listing_count(
         city=city, bedrooms=bedrooms, bathrooms=bathrooms,
         min_price=min_price, max_price=max_price,
         listing_type=listing_type, source=source, zips=zips,
         property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft,
-        search=search, zip_filter=zip_filter,
+        search=search, zip_filter=zip_filter, user_tag=user_tag,
     )
 
     return jsonify({"listings": data, "total": total, "limit": limit, "offset": offset})
+
+
+@app.route("/api/listings/<int:listing_id>", methods=["PATCH"])
+def api_tag_listing(listing_id: int):
+    """Set or clear the user_tag on a listing. Body: {"tag": "liked"|"disliked"|null}"""
+    body = request.get_json(silent=True) or {}
+    tag  = body.get("tag")
+    if tag not in ("liked", "disliked", None):
+        return jsonify({"error": "tag must be 'liked', 'disliked', or null"}), 400
+    set_listing_tag(listing_id, tag)
+    return jsonify({"id": listing_id, "tag": tag})
 
 
 @app.route("/api/export.csv", methods=["GET"])
@@ -310,18 +323,20 @@ def api_export_csv():
     sort_by       = request.args.get("sort_by")       or None
     zips          = _resolve_zips(request.args.get("neighborhood"), request.args.get("zips"))
 
+    user_tag      = request.args.get("user_tag") or None
+
     rows = get_listings(
         city=city, bedrooms=bedrooms, bathrooms=bathrooms,
         min_price=min_price, max_price=max_price,
         limit=5000, offset=0, listing_type=listing_type, source=source,
         zips=zips, property_type=property_type,
-        min_sqft=min_sqft, max_sqft=max_sqft, sort_by=sort_by,
+        min_sqft=min_sqft, max_sqft=max_sqft, sort_by=sort_by, user_tag=user_tag,
     )
 
     COLS = [
         "title", "price", "location", "bedrooms", "bathrooms", "sqft",
         "property_type", "listing_type", "source", "city", "zip",
-        "date_posted", "url",
+        "date_posted", "url", "user_tag",
     ]
 
     output = io.StringIO()

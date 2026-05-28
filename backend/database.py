@@ -78,6 +78,7 @@ def init_db(db_path: str = DB_PATH) -> None:
         _add_column_if_missing(conn, "listings", "zip",           "TEXT")
         _add_column_if_missing(conn, "listings", "lat",           "REAL")
         _add_column_if_missing(conn, "listings", "lng",           "REAL")
+        _add_column_if_missing(conn, "listings", "user_tag",      "TEXT")
         # Backfill ZIP for any pre-existing rows by parsing it out of location/title
         _backfill_zips(conn)
     logger.info("Database initialised at %s", db_path)
@@ -172,10 +173,18 @@ _SORT_SQL = {
 }
 
 
+def set_listing_tag(listing_id: int, tag: str | None, db_path: str = DB_PATH) -> None:
+    """Set or clear the user_tag on a single listing. tag must be 'liked', 'disliked', or None."""
+    with get_connection(db_path) as conn:
+        conn.execute("UPDATE listings SET user_tag = ? WHERE id = ?", (tag, listing_id))
+        conn.commit()
+
+
 def _filter_clauses(
     city, bedrooms, bathrooms, min_price, max_price,
     listing_type, source, zips,
     property_type=None, min_sqft=None, max_sqft=None, search=None, zip_filter=None,
+    user_tag=None,
 ):
     """Build WHERE clauses + params used by both list and count queries."""
     query  = ""
@@ -221,6 +230,11 @@ def _filter_clauses(
     if max_sqft:
         query += " AND CAST(COALESCE(NULLIF(sqft,''),'0') AS REAL) <= ?"
         params.append(float(max_sqft))
+    if user_tag == "untagged":
+        query += " AND (user_tag IS NULL OR TRIM(user_tag) = '')"
+    elif user_tag:
+        query += " AND user_tag = ?"
+        params.append(user_tag)
     return query, params
 
 
@@ -242,13 +256,14 @@ def get_listings(
     sort_by: str | None = None,
     search: str | None = None,
     zip_filter: str | None = None,
+    user_tag: str | None = None,
 ) -> list[dict]:
     """Return listings with optional filters."""
     where, params = _filter_clauses(
         city, bedrooms, bathrooms, min_price, max_price,
         listing_type, source, zips,
         property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft,
-        search=search, zip_filter=zip_filter,
+        search=search, zip_filter=zip_filter, user_tag=user_tag,
     )
     order = _SORT_SQL.get(sort_by or "", "date_scraped DESC")
     query = f"SELECT * FROM listings WHERE 1=1{where} ORDER BY {order} LIMIT ? OFFSET ?"
@@ -274,13 +289,14 @@ def get_listing_count(
     max_sqft: str | None = None,
     search: str | None = None,
     zip_filter: str | None = None,
+    user_tag: str | None = None,
 ) -> int:
     """Return total number of listings (optionally filtered)."""
     where, params = _filter_clauses(
         city, bedrooms, bathrooms, min_price, max_price,
         listing_type, source, zips,
         property_type=property_type, min_sqft=min_sqft, max_sqft=max_sqft,
-        search=search, zip_filter=zip_filter,
+        search=search, zip_filter=zip_filter, user_tag=user_tag,
     )
     query = "SELECT COUNT(*) AS count FROM listings WHERE 1=1" + where
     with get_connection(db_path) as conn:

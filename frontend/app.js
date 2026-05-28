@@ -103,6 +103,7 @@ let state = {
   filterMaxSqft:       "",
   filterSource:        "",
   filterPropertyType:  "",
+  filterTag:           "",
   sortBy:              "",
   scraping:            false,
   pollTimer:           null,
@@ -240,6 +241,7 @@ function buildFilterParams(limit, offset) {
   if (state.filterMaxSqft)      params.set("max_sqft",      state.filterMaxSqft);
   if (state.filterSource)       params.set("source",        state.filterSource);
   if (state.filterPropertyType) params.set("property_type", state.filterPropertyType);
+  if (state.filterTag)          params.set("user_tag",      state.filterTag);
   if (state.sortBy)             params.set("sort_by",       state.sortBy);
   return params;
 }
@@ -295,6 +297,9 @@ function renderListings() {
 function buildCard(l) {
   const card = document.createElement("article");
   card.className = "card";
+  if (l.user_tag) card.classList.add(`tagged-${l.user_tag}`);
+  card.dataset.id  = l.id;
+  card.dataset.tag = l.user_tag || "";
 
   const parts    = (l.title || "").split(" \u2013 ");
   const addrLine = parts[0] || l.title || "Untitled";
@@ -332,6 +337,9 @@ function buildCard(l) {
     ? `<a class="card-link" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer">View →</a>`
     : "";
 
+  const likeActive    = l.user_tag === "liked"    ? " tag-active" : "";
+  const dislikeActive = l.user_tag === "disliked" ? " tag-active" : "";
+
   const imgClass = l.source ? `card-img src-${esc(l.source)}` : "card-img";
 
   card.innerHTML = `
@@ -351,6 +359,14 @@ function buildCard(l) {
       <div class="card-meta">${meta.join("")}</div>
       ${propTag}
     </div>
+    <div class="card-actions">
+      <button class="tag-btn tag-btn-like${likeActive}" data-tag="liked">
+        ♥ Like
+      </button>
+      <button class="tag-btn tag-btn-dislike${dislikeActive}" data-tag="disliked">
+        ✕ Pass
+      </button>
+    </div>
     <div class="card-footer">
       <span class="card-date">${dateStr}</span>
       ${link}
@@ -364,6 +380,7 @@ const TABLE_PAGE_SIZE = 100;
 let _tableSort = { col: "price", dir: "desc" };
 
 const TABLE_COLS = [
+  { key: "_tag",          label: "Tag",          sortable: false },
   { key: "price",         label: "Price",        sortable: true  },
   { key: "title",         label: "Address",      sortable: true  },
   { key: "city",          label: "City",         sortable: true  },
@@ -438,7 +455,16 @@ async function loadAndRenderTable() {
       const link = l.url
         ? `<a class="col-link" href="${esc(l.url)}" target="_blank" rel="noopener noreferrer">View →</a>`
         : "";
-      return `<tr>
+      const likeActive    = l.user_tag === "liked"    ? " tag-active" : "";
+      const dislikeActive = l.user_tag === "disliked" ? " tag-active" : "";
+      const tagCell = `
+        <div class="tbl-tag-btns">
+          <button class="tbl-tag-btn tbl-tag-btn-like${likeActive}" data-tag="liked" title="Like">♥</button>
+          <button class="tbl-tag-btn tbl-tag-btn-dislike${dislikeActive}" data-tag="disliked" title="Pass">✕</button>
+        </div>`;
+      const rowClass = l.user_tag ? ` class="tagged-${esc(l.user_tag)}"` : "";
+      return `<tr${rowClass} data-id="${l.id}" data-tag="${esc(l.user_tag || "")}">
+        <td>${tagCell}</td>
         <td class="col-price">${esc(fmtPrice(l.price))}</td>
         <td class="col-addr" title="${esc(addr)}">${esc(addr)}</td>
         <td>${esc(l.city || "")}</td>
@@ -803,7 +829,7 @@ function clearFilters() {
   const ids = [
     "filter-search", "filter-zip",
     "filter-city", "filter-neighborhood", "filter-type", "filter-property-type",
-    "filter-sort", "filter-bedrooms", "filter-bathrooms", "filter-source",
+    "filter-sort", "filter-bedrooms", "filter-bathrooms", "filter-source", "filter-tag",
     "filter-min-price", "filter-max-price", "filter-min-sqft", "filter-max-sqft",
   ];
   ids.forEach(id => { if ($(id)) $(id).value = ""; });
@@ -811,9 +837,53 @@ function clearFilters() {
     filterSearch: "", filterZip: "", filterCity: "", filterNeighborhood: "", filterType: "",
     filterBedrooms: "", filterBathrooms: "", filterMinPrice: "", filterMaxPrice: "",
     filterMinSqft: "", filterMaxSqft: "", filterSource: "", filterPropertyType: "",
-    sortBy: "", offset: 0,
+    filterTag: "", sortBy: "", offset: 0,
   });
   loadListings();
+}
+
+// ── Tagging ───────────────────────────────────────────────────
+async function tagListing(id, tag) {
+  await apiFetch(`/api/listings/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tag }),
+  });
+}
+
+// Shared tag-click handler — works for both grid cards and table rows
+function _applyTagUI(container, newTag, currentTag, isTable) {
+  container.dataset.tag = newTag || "";
+  container.classList.toggle("tagged-liked",    newTag === "liked");
+  container.classList.toggle("tagged-disliked", newTag === "disliked");
+  const btnSel = isTable ? ".tbl-tag-btn" : ".tag-btn";
+  container.querySelectorAll(btnSel).forEach(b => b.classList.remove("tag-active"));
+  if (newTag) container.querySelector(`${btnSel}[data-tag="${newTag}"]`)?.classList.add("tag-active");
+}
+
+async function _handleTagClick(e, isTable) {
+  const btnSel = isTable ? ".tbl-tag-btn" : ".tag-btn";
+  const btn = e.target.closest(btnSel);
+  if (!btn) return;
+  const container  = isTable ? btn.closest("tr") : btn.closest(".card");
+  if (!container) return;
+  const id         = parseInt(container.dataset.id, 10);
+  const clickedTag = btn.dataset.tag;
+  const currentTag = container.dataset.tag;
+  const newTag     = currentTag === clickedTag ? null : clickedTag;
+
+  _applyTagUI(container, newTag, currentTag, isTable);
+  try {
+    await tagListing(id, newTag);
+  } catch {
+    _applyTagUI(container, currentTag, newTag, isTable); // rollback
+  }
+}
+
+// Event delegation — one listener on the grid, one on the table container
+function wireTagClicks() {
+  grid.addEventListener("click", e => _handleTagClick(e, false));
+  tableContainer.addEventListener("click", e => _handleTagClick(e, true));
 }
 
 // ── Event wiring ──────────────────────────────────────────────
@@ -853,6 +923,7 @@ function wireEvents() {
     ["filter-bedrooms",      "filterBedrooms"],
     ["filter-bathrooms",     "filterBathrooms"],
     ["filter-source",        "filterSource"],
+    ["filter-tag",           "filterTag"],
   ];
   selFilters.forEach(([id, key]) => {
     $(id).addEventListener("change", e => {
@@ -911,6 +982,7 @@ async function init() {
   applyTheme(savedTheme);
 
   wireEvents();
+  wireTagClicks();
   await Promise.all([loadCities(), loadNeighborhoods(), loadPropertyTypes()]);
   await loadListings();
   try {
